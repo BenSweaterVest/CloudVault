@@ -1,0 +1,38 @@
+name = "cloudvault-api"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[vars]
+ENVIRONMENT = "development"
+
+# =============================================================================
+# D1 DATABASE
+# =============================================================================
+# Create with: wrangler d1 create cloudvault-db
+# Then replace YOUR_DATABASE_ID_HERE with the id from the output
+[[d1_databases]]
+binding = "DB"
+database_name = "cloudvault-db"
+database_id = "YOUR_DATABASE_ID_HERE"
+
+# =============================================================================
+# KV NAMESPACE (for rate limiting, token blacklist, session tracking)
+# =============================================================================
+# Create with: wrangler kv:namespace create "RATE_LIMIT"
+# Then replace YOUR_KV_NAMESPACE_ID_HERE with the id from the output
+[[kv_namespaces]]
+binding = "KV"
+id = "YOUR_KV_NAMESPACE_ID_HERE"
+
+# =============================================================================
+# SECRETS (set via wrangler secret put <NAME>)
+# =============================================================================
+# Required secrets:
+#   wrangler secret put GITHUB_CLIENT_ID
+#   wrangler secret put GITHUB_CLIENT_SECRET
+#   wrangler secret put JWT_SECRET
+#   wrangler secret put APP_URL
+#
+# Optional secrets:
+#   wrangler secret put RESEND_API_KEY    # For magic link emails
+#   wrangler secret put EMAIL_FROM        # Custom sender address

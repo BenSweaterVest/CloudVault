@@ -1,0 +1,27 @@
+# CloudVault Worker Environment Variables
+# Copy this file to .dev.vars and fill in your values
+
+# GitHub OAuth (required)
+# Create at: https://github.com/settings/applications/new
+GITHUB_CLIENT_ID=your_github_client_id
+GITHUB_CLIENT_SECRET=your_github_client_secret
+
+# JWT Secret (required)
+# Generate a secure random string for signing tokens
+JWT_SECRET=your_secure_random_string_at_least_32_characters
+
+# App URL (required)
+# Your frontend URL
+APP_URL=http://localhost:5173
+
+# Resend API Key (optional, for magic link emails)
+# Get one at: https://resend.com
+RESEND_API_KEY=re_your_resend_api_key
+
+# Email sender address (optional)
+# Default: CloudVault <noreply@cloudvault.app>
+# EMAIL_FROM=YourApp <noreply@yourdomain.com>
+
+# Magic link expiration in minutes (optional)
+# Default: 15
+# MAGIC_LINK_EXPIRY_MINUTES=30
