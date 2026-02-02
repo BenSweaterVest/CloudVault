@@ -19,6 +19,7 @@ export interface JWTPayload {
   iat: number;
   exp: number;
   jti?: string; // JWT ID for blacklist tracking
+  sessionTimeout?: number; // Session timeout in minutes (cached from user preferences)
 }
 
 /**
@@ -33,17 +34,25 @@ function generateJti(): string {
  */
 export async function createToken(
   user: { id: string; email: string; name: string | null },
-  secret: string
+  secret: string,
+  sessionTimeout?: number
 ): Promise<string> {
   const secretKey = new TextEncoder().encode(secret);
   const jti = generateJti();
 
-  return new jose.SignJWT({
+  const payload: Record<string, unknown> = {
     sub: user.id,
     email: user.email,
     name: user.name,
     jti,
-  })
+  };
+
+  // Include session timeout in JWT to avoid DB query on every request
+  if (sessionTimeout !== undefined) {
+    payload.sessionTimeout = sessionTimeout;
+  }
+
+  return new jose.SignJWT(payload)
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
     .setExpirationTime('7d')
@@ -107,20 +116,15 @@ async function updateLastActivity(kv: KVNamespace, userId: string): Promise<void
 
 /**
  * Check if session has timed out based on user preferences
+ * Now uses cached timeout from JWT to avoid DB query on every request
  */
 async function isSessionTimedOut(
   kv: KVNamespace,
-  db: D1Database,
-  userId: string
+  userId: string,
+  cachedTimeoutMinutes?: number
 ): Promise<boolean> {
-  // Get user's session timeout preference
-  const prefs = await db.prepare(
-    'SELECT session_timeout FROM user_preferences WHERE user_id = ?'
-  )
-    .bind(userId)
-    .first<{ session_timeout: number }>();
-
-  const timeoutMinutes = prefs?.session_timeout ?? DEFAULT_SESSION_TIMEOUT_MINUTES;
+  // Use cached timeout from JWT, or default if not available
+  const timeoutMinutes = cachedTimeoutMinutes ?? DEFAULT_SESSION_TIMEOUT_MINUTES;
 
   // If timeout is 0, session never times out
   if (timeoutMinutes === 0) {
@@ -167,8 +171,8 @@ export async function authMiddleware(
       }
     }
 
-    // Check session timeout
-    const timedOut = await isSessionTimedOut(c.env.KV, c.env.DB, payload.sub);
+    // Check session timeout (using cached value from JWT)
+    const timedOut = await isSessionTimedOut(c.env.KV, payload.sub, payload.sessionTimeout);
     if (timedOut) {
       return c.json({ error: 'Session timed out', code: 'SESSION_TIMEOUT' }, 401);
     }

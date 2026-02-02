@@ -163,10 +163,18 @@ authRoutes.post('/github/callback', async (c) => {
     isNewUser = true;
   }
   
-  // Create JWT
+  // Fetch session timeout preference for caching in JWT
+  const prefs = await c.env.DB.prepare(
+    'SELECT session_timeout FROM user_preferences WHERE user_id = ?'
+  )
+    .bind(user.id)
+    .first<{ session_timeout: number }>();
+
+  // Create JWT with cached session timeout
   const token = await createToken(
     { id: user.id, email: user.email, name: user.name },
-    c.env.JWT_SECRET
+    c.env.JWT_SECRET,
+    prefs?.session_timeout
   );
   
   // Log audit event
@@ -333,10 +341,18 @@ authRoutes.post('/magic-link/verify', async (c) => {
     isNewUser = true;
   }
   
-  // Create JWT
+  // Fetch session timeout preference for caching in JWT
+  const prefs = await c.env.DB.prepare(
+    'SELECT session_timeout FROM user_preferences WHERE user_id = ?'
+  )
+    .bind(existingUser.id)
+    .first<{ session_timeout: number }>();
+
+  // Create JWT with cached session timeout
   const jwtToken = await createToken(
     { id: existingUser.id, email: existingUser.email, name: existingUser.name },
-    c.env.JWT_SECRET
+    c.env.JWT_SECRET,
+    prefs?.session_timeout
   );
   
   // Log audit event

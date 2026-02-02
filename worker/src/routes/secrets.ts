@@ -10,42 +10,12 @@ import type { Env, Variables } from '../index';
 import { authMiddleware } from '../middleware/auth';
 import { createAuditLogger } from '../middleware/audit';
 import { validateBody, createSecretSchema, updateSecretSchema, toggleFavoriteSchema } from '../lib/validation';
+import { checkOrgAccess } from '../lib/db-utils';
 
 export const secretsRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 // All routes require authentication
 secretsRoutes.use('*', authMiddleware);
-
-// ============================================
-// HELPER: Check Organization Access
-// ============================================
-
-async function checkOrgAccess(
-  db: D1Database,
-  userId: string,
-  orgId: string,
-  requiredRole?: 'admin' | 'member'
-): Promise<{ role: string } | null> {
-  const membership = await db
-    .prepare(
-      'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-    )
-    .bind(userId, orgId, 'active')
-    .first<{ role: string }>();
-  
-  if (!membership) return null;
-  
-  if (requiredRole === 'admin' && membership.role !== 'admin') {
-    return null;
-  }
-  
-  if (requiredRole === 'member' && membership.role === 'read_only') {
-    return null;
-  }
-  
-  return membership;
-}
-
 // ============================================
 // SECRET TYPE DEFINITIONS
 // ============================================
