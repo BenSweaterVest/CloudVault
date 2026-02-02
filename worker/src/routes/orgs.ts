@@ -493,12 +493,12 @@ orgsRoutes.delete('/:orgId', async (c) => {
     return c.json({ error: 'Organization not found' }, 404);
   }
   
-  // Check if this is the only admin
-  const adminCount = await c.env.DB.prepare(
-    'SELECT COUNT(*) as count FROM memberships WHERE org_id = ? AND role = ? AND status = ?'
-  )
-    .bind(orgId, 'admin', 'active')
-    .first<{ count: number }>();
+  // Check if this is the only admin (currently unused but kept for future feature)
+  // const adminCount = await c.env.DB.prepare(
+  //   'SELECT COUNT(*) as count FROM memberships WHERE org_id = ? AND role = ? AND status = ?'
+  // )
+  //   .bind(orgId, 'admin', 'active')
+  //   .first<{ count: number }>();
   
   // Get member count for confirmation
   const memberCount = await c.env.DB.prepare(

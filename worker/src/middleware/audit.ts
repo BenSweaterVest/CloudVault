@@ -60,6 +60,7 @@ export type AuditAction =
 export type TargetType = 
   | 'secret' 
   | 'user' 
+  | 'org'
   | 'organization' 
   | 'membership' 
   | 'category'
@@ -190,7 +191,7 @@ export function createAuditLogger(
  * Automatic audit middleware that logs based on route patterns
  */
 export function auditMiddleware(
-  c: Context<{ Bindings: Env; Variables: Variables }>,
+  _c: Context<{ Bindings: Env; Variables: Variables }>,
   next: Next
 ) {
   // The actual logging is done in individual route handlers using createAuditLogger
