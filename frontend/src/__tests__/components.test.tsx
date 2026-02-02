@@ -16,9 +16,6 @@ const renderWithRouter = (component: React.ReactElement) => {
     </BrowserRouter>
   );
 };
-    </BrowserRouter>
-  );
-}
 
 // ============================================
 // TOAST COMPONENT TESTS

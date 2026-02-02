@@ -58,7 +58,7 @@ describe('Organization Creation Flow', () => {
   it('should create organization and encrypt key for creator', async () => {
     // Setup user keys first
     const masterPassword = 'UserP@ssw0rd!';
-    const { key: _masterKey } = await generateMasterKeyFromPassword(masterPassword);
+    await generateMasterKeyFromPassword(masterPassword);
     const { publicKey, privateKey } = await generateKeyPair();
 
     // Create organization
