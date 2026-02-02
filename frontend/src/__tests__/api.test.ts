@@ -25,7 +25,7 @@ import {
   orgsApi, 
   categoriesApi, 
   preferencesApi,
-  auditApi,
+  // auditApi,  // Commented out - not used in tests yet
   ApiError 
 } from '../lib/api';
 

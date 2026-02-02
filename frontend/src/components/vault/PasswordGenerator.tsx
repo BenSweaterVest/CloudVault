@@ -100,6 +100,7 @@ export default function PasswordGenerator({ onSelect, onClose }: PasswordGenerat
   }, [charset, options]);
 
   // Generate initial password on mount
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     generatePassword();
   }, []);

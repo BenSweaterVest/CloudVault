@@ -6,10 +6,11 @@
  * @module components/admin/UserManagement
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useVault } from '../../hooks/useVault';
-import { orgsApi, type Membership } from '../../lib/api';
+import { orgsApi, usersApi, type Membership } from '../../lib/api';
 import { grantOrgAccess } from '../../lib/crypto';
+import { useToast } from '../ui/Toast';
 
 const ROLE_LABELS: Record<string, { label: string; description: string }> = {
   admin: { label: 'Admin', description: 'Full access, can manage users' },
@@ -19,6 +20,7 @@ const ROLE_LABELS: Record<string, { label: string; description: string }> = {
 
 export default function UserManagement() {
   const { currentOrg, getOrgKey } = useVault();
+  const { error: showError } = useToast();
   
   const [members, setMembers] = useState<Membership[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -27,12 +29,7 @@ export default function UserManagement() {
   const [isInviting, setIsInviting] = useState(false);
   const [showInviteForm, setShowInviteForm] = useState(false);
 
-  useEffect(() => {
-    if (!currentOrg) return;
-    loadMembers();
-  }, [currentOrg]);
-
-  const loadMembers = async () => {
+  const loadMembers = useCallback(async () => {
     if (!currentOrg) return;
     
     setIsLoading(true);
@@ -43,10 +40,16 @@ export default function UserManagement() {
       setMembers(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load members');
+      showError('Error', 'Failed to load members');
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [currentOrg, showError]);
+
+  useEffect(() => {
+    if (!currentOrg) return;
+    loadMembers();
+  }, [currentOrg, loadMembers]);
 
   const handleInvite = async (e: React.FormEvent) => {
     e.preventDefault();

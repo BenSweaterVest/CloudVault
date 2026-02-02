@@ -10,8 +10,8 @@ import { useAuth } from '../../lib/auth';
 import { authApi } from '../../lib/api';
 
 export default function LoginForm() {
-  const { login } = useAuth();
-  const navigate = useNavigate();
+  // const { login } = useAuth();  // TODO: Implement OAuth login flow
+  // const navigate = useNavigate();  // TODO: Use for post-login navigation
   
   const [email, setEmail] = useState('');
   const [isLoading, setIsLoading] = useState(false);
