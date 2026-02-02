@@ -5,14 +5,9 @@
  */
 
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { useAuth } from '../../lib/auth';
 import { authApi } from '../../lib/api';
 
 export default function LoginForm() {
-  // const { login } = useAuth();  // TODO: Implement OAuth login flow
-  // const navigate = useNavigate();  // TODO: Use for post-login navigation
-  
   const [email, setEmail] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [magicLinkSent, setMagicLinkSent] = useState(false);

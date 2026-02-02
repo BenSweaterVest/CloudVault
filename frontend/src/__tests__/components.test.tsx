@@ -6,23 +6,16 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-// import userEvent from '@testing-library/user-event';  // TODO: Use for more realistic user interactions
 import { BrowserRouter } from 'react-router-dom';
 
 // Test utilities
-// const renderWithRouter = (component: React.ReactElement) => {
-//   return render(
-//     <BrowserRouter>
-//       {component}
-//     </BrowserRouter>
-//   );
-// };
-
-// Helper to render components with router context
-function renderWithRouter(component: React.ReactElement) {
+const renderWithRouter = (component: React.ReactElement) => {
   return render(
     <BrowserRouter>
       {component}
+    </BrowserRouter>
+  );
+};
     </BrowserRouter>
   );
 }
@@ -341,7 +334,6 @@ describe('PasswordGenerator', () => {
     
     // Get initial password from code element
     const passwordField = document.querySelector('code');
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     expect(passwordField).toBeInTheDocument();
     
     // Click regenerate
@@ -350,7 +342,7 @@ describe('PasswordGenerator', () => {
     await waitFor(() => {
       const password = passwordField?.textContent;
       expect(password).toBeDefined();
-      expect(password!.length).toBeGreaterThan(0);
+      expect(password).not.toBe('');
     });
   });
 

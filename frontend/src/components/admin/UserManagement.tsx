@@ -8,7 +8,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { useVault } from '../../hooks/useVault';
-import { orgsApi, usersApi, type Membership } from '../../lib/api';
+import { orgsApi, type Membership } from '../../lib/api';
 import { grantOrgAccess } from '../../lib/crypto';
 import { useToast } from '../ui/Toast';
 

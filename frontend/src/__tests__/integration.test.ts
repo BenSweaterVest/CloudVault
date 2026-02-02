@@ -58,7 +58,7 @@ describe('Organization Creation Flow', () => {
   it('should create organization and encrypt key for creator', async () => {
     // Setup user keys first
     const masterPassword = 'UserP@ssw0rd!';
-    const { key: masterKey } = await generateMasterKeyFromPassword(masterPassword);
+    const { key: _masterKey } = await generateMasterKeyFromPassword(masterPassword);
     const { publicKey, privateKey } = await generateKeyPair();
 
     // Create organization
@@ -161,9 +161,9 @@ describe('Multi-User Access Flow', () => {
   it('should allow multiple users to access same organization', async () => {
     // User A creates the organization
     const userAPassword = 'UserAP@ss!';
-    const { key: _userAMasterKey } = await generateMasterKeyFromPassword(userAPassword);
+    await generateMasterKeyFromPassword(userAPassword);
     const { publicKey: userAPublicKey, privateKey: userAPrivateKey } = await generateKeyPair();
-    const _userAPublicKeyString = await exportPublicKey(userAPublicKey);
+    await exportPublicKey(userAPublicKey);
 
     // Create org key
     const orgKey = await generateOrgKey();
@@ -173,9 +173,9 @@ describe('Multi-User Access Flow', () => {
 
     // User B joins the organization
     const userBPassword = 'UserBP@ss!';
-    const { key: _userBMasterKey } = await generateMasterKeyFromPassword(userBPassword);
+    await generateMasterKeyFromPassword(userBPassword);
     const { publicKey: userBPublicKey, privateKey: userBPrivateKey } = await generateKeyPair();
-    const _userBPublicKeyString = await exportPublicKey(userBPublicKey);
+    await exportPublicKey(userBPublicKey);
 
     // Admin (User A) needs to:
     // 1. Decrypt the org key with their private key
