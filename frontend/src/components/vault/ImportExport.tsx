@@ -215,31 +215,39 @@ export default function ImportExport() {
     setImportProgress({ current: 0, total: parsedSecrets.length });
     
     try {
-      // Encrypt each secret and prepare for import
+      // Encrypt all secrets in parallel for better performance
+      // For large batches, we process in chunks to avoid overwhelming the browser
+      const CHUNK_SIZE = 50; // Process 50 secrets at a time
       const encryptedSecrets = [];
       
-      for (let i = 0; i < parsedSecrets.length; i++) {
-        const secret = parsedSecrets[i];
-        setImportProgress({ current: i + 1, total: parsedSecrets.length });
+      for (let i = 0; i < parsedSecrets.length; i += CHUNK_SIZE) {
+        const chunk = parsedSecrets.slice(i, i + CHUNK_SIZE);
         
-        // Encrypt the secret data
-        const { ciphertext, iv } = await encryptSecret(
-          {
-            username: secret.username || '',
-            password: secret.password || '',
-            notes: secret.notes || '',
-          },
-          orgKey
+        // Encrypt chunk in parallel
+        const encryptedChunk = await Promise.all(
+          chunk.map(async (secret) => {
+            const { ciphertext, iv } = await encryptSecret(
+              {
+                username: secret.username || '',
+                password: secret.password || '',
+                notes: secret.notes || '',
+              },
+              orgKey
+            );
+            
+            return {
+              name: secret.name,
+              url: secret.url,
+              usernameHint: secret.username?.substring(0, 50),
+              ciphertextBlob: ciphertext,
+              iv,
+              secretType: secret.type || 'password',
+            };
+          })
         );
         
-        encryptedSecrets.push({
-          name: secret.name,
-          url: secret.url,
-          usernameHint: secret.username?.substring(0, 50),
-          ciphertextBlob: ciphertext,
-          iv,
-          secretType: secret.type || 'password',
-        });
+        encryptedSecrets.push(...encryptedChunk);
+        setImportProgress({ current: Math.min(i + CHUNK_SIZE, parsedSecrets.length), total: parsedSecrets.length });
       }
       
       // Send to API

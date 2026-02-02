@@ -69,7 +69,7 @@ window.ResizeObserver = ResizeObserverMock;
 
 // Mock IntersectionObserver
 class IntersectionObserverMock {
-  constructor(callback: IntersectionObserverCallback) {}
+  constructor(_callback: IntersectionObserverCallback) {}
   observe() {}
   unobserve() {}
   disconnect() {}

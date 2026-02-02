@@ -4,7 +4,8 @@
  * Tests for the zero-knowledge encryption utilities.
  */
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect } from 'vitest';
+// import { beforeAll } from 'vitest';  // TODO: Use for test setup if needed
 import {
   generateMasterKeyFromPassword,
   deriveKeyFromPassword,
@@ -104,8 +105,8 @@ describe('Crypto Module', () => {
 
   describe('Private Key Encryption', () => {
     it('should encrypt and decrypt private key with master password', async () => {
-      const { publicKey, privateKey } = await generateKeyPair();
-      const { key, salt } = await generateMasterKeyFromPassword(testPassword);
+      const { privateKey } = await generateKeyPair();
+      const { key } = await generateMasterKeyFromPassword(testPassword);
       
       const encryptedPrivateKey = await encryptPrivateKey(privateKey, key);
       

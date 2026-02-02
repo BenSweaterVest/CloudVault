@@ -10,7 +10,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useVault } from '../../hooks/useVault';
-import { secretsApi, type Secret, type SecretHistory } from '../../lib/api';
+import { secretsApi, type SecretHistory } from '../../lib/api';
 import { useToast } from '../ui/Toast';
 import TOTPDisplay from './TOTPDisplay';
 import ShareModal from './ShareModal';

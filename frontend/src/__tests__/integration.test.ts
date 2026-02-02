@@ -4,7 +4,8 @@
  * Tests for complete user flows and feature interactions.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
+// import { vi } from 'vitest';  // TODO: Use for mocking if needed
 import {
   generateMasterKeyFromPassword,
   deriveKeyFromPassword,
@@ -23,7 +24,7 @@ import {
 describe('Full User Registration Flow', () => {
   it('should complete registration and setup flow', async () => {
     // Simulate user registration
-    const email = 'newuser@example.com';
+    // const email = 'newuser@example.com';  // TODO: Use for API mocking
     const masterPassword = 'StrongP@ssw0rd!123';
 
     // Step 1: Generate master key from password
@@ -57,7 +58,7 @@ describe('Organization Creation Flow', () => {
   it('should create organization and encrypt key for creator', async () => {
     // Setup user keys first
     const masterPassword = 'UserP@ssw0rd!';
-    const { key: masterKey, salt } = await generateMasterKeyFromPassword(masterPassword);
+    await generateMasterKeyFromPassword(masterPassword);
     const { publicKey, privateKey } = await generateKeyPair();
 
     // Create organization
@@ -160,9 +161,9 @@ describe('Multi-User Access Flow', () => {
   it('should allow multiple users to access same organization', async () => {
     // User A creates the organization
     const userAPassword = 'UserAP@ss!';
-    const { key: userAMasterKey } = await generateMasterKeyFromPassword(userAPassword);
+    await generateMasterKeyFromPassword(userAPassword);
     const { publicKey: userAPublicKey, privateKey: userAPrivateKey } = await generateKeyPair();
-    const userAPublicKeyString = await exportPublicKey(userAPublicKey);
+    await exportPublicKey(userAPublicKey);
 
     // Create org key
     const orgKey = await generateOrgKey();
@@ -172,9 +173,9 @@ describe('Multi-User Access Flow', () => {
 
     // User B joins the organization
     const userBPassword = 'UserBP@ss!';
-    const { key: userBMasterKey } = await generateMasterKeyFromPassword(userBPassword);
+    await generateMasterKeyFromPassword(userBPassword);
     const { publicKey: userBPublicKey, privateKey: userBPrivateKey } = await generateKeyPair();
-    const userBPublicKeyString = await exportPublicKey(userBPublicKey);
+    await exportPublicKey(userBPublicKey);
 
     // Admin (User A) needs to:
     // 1. Decrypt the org key with their private key
@@ -232,7 +233,7 @@ describe('Vault Lock/Unlock Flow', () => {
     const wrongPassword = 'WrongP@ss!';
 
     const { key: masterKey, salt } = await generateMasterKeyFromPassword(correctPassword);
-    const { publicKey, privateKey } = await generateKeyPair();
+    const { privateKey } = await generateKeyPair();
     const encryptedPrivateKey = await encryptPrivateKey(privateKey, masterKey);
 
     // Try to unlock with wrong password

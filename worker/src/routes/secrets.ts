@@ -88,7 +88,7 @@ secretsRoutes.get('/:orgId/secrets', async (c) => {
   const categoryId = url.searchParams.get('categoryId');
   const secretType = url.searchParams.get('type');
   const favoritesOnly = url.searchParams.get('favorites') === 'true';
-  const search = url.searchParams.get('search')?.toLowerCase();
+  const search = url.searchParams.get('search');
   
   // Check access
   const membership = await checkOrgAccess(c.env.DB, user.id, orgId);
@@ -122,28 +122,30 @@ secretsRoutes.get('/:orgId/secrets', async (c) => {
     query += ' AND s.is_favorite = 1';
   }
   
+  // Server-side search filter for better performance
+  // Search across name, url, username_hint, and tags (these are NOT encrypted)
+  if (search) {
+    const searchPattern = `%${search}%`;
+    query += ` AND (
+      s.name LIKE ? COLLATE NOCASE OR 
+      s.url LIKE ? COLLATE NOCASE OR 
+      s.username_hint LIKE ? COLLATE NOCASE OR 
+      s.tags LIKE ? COLLATE NOCASE
+    )`;
+    params.push(searchPattern, searchPattern, searchPattern, searchPattern);
+  }
+  
   query += ' ORDER BY s.is_favorite DESC, s.name';
   
   const results = await c.env.DB.prepare(query)
     .bind(...params)
     .all<SecretRow & { category_name: string | null; category_color: string | null }>();
   
-  let secrets = results.results.map((s) => ({
+  const secrets = results.results.map((s) => ({
     ...mapSecretRow(s),
     categoryName: s.category_name,
     categoryColor: s.category_color,
   }));
-  
-  // Client-side search filter (since data is encrypted)
-  if (search) {
-    secrets = secrets.filter(
-      (s) =>
-        s.name.toLowerCase().includes(search) ||
-        s.url?.toLowerCase().includes(search) ||
-        s.usernameHint?.toLowerCase().includes(search) ||
-        s.tags.some((t) => String(t).toLowerCase().includes(search))
-    );
-  }
   
   return c.json(secrets);
 });
@@ -674,6 +676,9 @@ secretsRoutes.post('/:orgId/secrets/import', async (c) => {
   const imported: string[] = [];
   const errors: Array<{ index: number; name: string; error: string }> = [];
   
+  // First pass: Validate all secrets and prepare data
+  const validSecrets: Array<{ index: number; secret: typeof body.secrets[0]; secretId: string }> = [];
+  
   for (let i = 0; i < body.secrets.length; i++) {
     const secret = body.secrets[i];
     
@@ -687,19 +692,24 @@ secretsRoutes.post('/:orgId/secrets/import', async (c) => {
       continue;
     }
     
+    const secretId = crypto.randomUUID();
+    validSecrets.push({ index: i, secret, secretId });
+  }
+  
+  // Second pass: Batch insert all valid secrets
+  if (validSecrets.length > 0) {
     try {
-      const secretId = crypto.randomUUID();
-      const secretType = secret.secretType || 'password';
-      const tags = secret.tags ? JSON.stringify(secret.tags) : null;
-      
-      await c.env.DB.prepare(`
-        INSERT INTO secrets (
-          id, org_id, name, url, username_hint, ciphertext_blob, iv,
-          version, created_by, category_id, secret_type, tags, expires_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-      `)
-        .bind(
+      const statements = validSecrets.map(({ secret, secretId }) => {
+        const secretType = secret.secretType || 'password';
+        const tags = secret.tags ? JSON.stringify(secret.tags) : null;
+        
+        return c.env.DB.prepare(`
+          INSERT INTO secrets (
+            id, org_id, name, url, username_hint, ciphertext_blob, iv,
+            version, created_by, category_id, secret_type, tags, expires_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+        `).bind(
           secretId,
           orgId,
           secret.name.slice(0, 200),
@@ -712,16 +722,53 @@ secretsRoutes.post('/:orgId/secrets/import', async (c) => {
           secretType,
           tags,
           secret.expiresAt || null
-        )
-        .run();
-      
-      imported.push(secretId);
-    } catch (err) {
-      errors.push({
-        index: i,
-        name: secret.name,
-        error: 'Database error'
+        );
       });
+      
+      // Execute all inserts in a single batch transaction
+      await c.env.DB.batch(statements);
+      
+      // All succeeded - collect IDs
+      imported.push(...validSecrets.map(v => v.secretId));
+    } catch (err) {
+      // If batch fails, fall back to individual inserts to identify which ones failed
+      for (const { index, secret, secretId } of validSecrets) {
+        try {
+          const secretType = secret.secretType || 'password';
+          const tags = secret.tags ? JSON.stringify(secret.tags) : null;
+          
+          await c.env.DB.prepare(`
+            INSERT INTO secrets (
+              id, org_id, name, url, username_hint, ciphertext_blob, iv,
+              version, created_by, category_id, secret_type, tags, expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+          `)
+            .bind(
+              secretId,
+              orgId,
+              secret.name.slice(0, 200),
+              secret.url || null,
+              secret.usernameHint?.slice(0, 200) || null,
+              secret.ciphertextBlob,
+              secret.iv,
+              user.id,
+              body.categoryId || null,
+              secretType,
+              tags,
+              secret.expiresAt || null
+            )
+            .run();
+          
+          imported.push(secretId);
+        } catch (err) {
+          errors.push({
+            index,
+            name: secret.name,
+            error: 'Database error'
+          });
+        }
+      }
     }
   }
   

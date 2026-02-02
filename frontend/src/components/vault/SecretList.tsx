@@ -28,7 +28,7 @@ export default function SecretList() {
     organizations,
     secrets,
     isLoading,
-    error,
+    // error,  // TODO: Display error state in UI
     unlock,
     loadOrganizations,
     selectOrg,
@@ -123,7 +123,7 @@ export default function SecretList() {
 
   // Filter and sort secrets
   const filteredSecrets = useMemo(() => {
-    let result = secrets.filter((secret) => {
+    const result = secrets.filter((secret) => {
       // Text search
       const matchesSearch = 
         secret.name.toLowerCase().includes(searchQuery.toLowerCase()) ||

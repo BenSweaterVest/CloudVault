@@ -8,6 +8,7 @@ import { Hono } from 'hono';
 import type { Env, Variables } from '../index';
 import { authMiddleware } from '../middleware/auth';
 import { createAuditLogger } from '../middleware/audit';
+import { checkOrgAccess } from '../lib/db-utils';
 
 export const orgsRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
 
@@ -116,11 +117,7 @@ orgsRoutes.get('/:orgId', async (c) => {
   const orgId = c.req.param('orgId');
   
   // Check membership
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId);
   
   if (!membership) {
     return c.json({ error: 'Not a member of this organization' }, 403);
@@ -154,13 +151,9 @@ orgsRoutes.get('/:orgId/members', async (c) => {
   const orgId = c.req.param('orgId');
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -218,13 +211,9 @@ orgsRoutes.post('/:orgId/members', async (c) => {
   const audit = createAuditLogger(c);
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -301,13 +290,9 @@ orgsRoutes.post('/:orgId/members/:userId/approve', async (c) => {
   const audit = createAuditLogger(c);
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -365,13 +350,9 @@ orgsRoutes.patch('/:orgId/members/:userId', async (c) => {
   const audit = createAuditLogger(c);
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -412,13 +393,9 @@ orgsRoutes.delete('/:orgId/members/:userId', async (c) => {
   const audit = createAuditLogger(c);
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -474,13 +451,9 @@ orgsRoutes.delete('/:orgId', async (c) => {
   const audit = createAuditLogger(c);
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -527,64 +500,43 @@ orgsRoutes.delete('/:orgId', async (c) => {
   });
   
   // Delete in order (respecting foreign key constraints)
-  // Note: Most tables have ON DELETE CASCADE, but we'll be explicit
-  
-  // Delete share links
-  await c.env.DB.prepare('DELETE FROM share_links WHERE org_id = ?')
-    .bind(orgId)
-    .run();
-  
-  // Delete emergency requests and contacts
-  await c.env.DB.prepare('DELETE FROM emergency_requests WHERE org_id = ?')
-    .bind(orgId)
-    .run();
-  await c.env.DB.prepare('DELETE FROM emergency_contacts WHERE org_id = ?')
-    .bind(orgId)
-    .run();
-  
-  // Delete organization settings
-  await c.env.DB.prepare('DELETE FROM organization_settings WHERE org_id = ?')
-    .bind(orgId)
-    .run();
-  
-  // Delete custom field values and definitions
-  await c.env.DB.prepare(`
-    DELETE FROM custom_field_values 
-    WHERE secret_id IN (SELECT id FROM secrets WHERE org_id = ?)
-  `)
-    .bind(orgId)
-    .run();
-  await c.env.DB.prepare('DELETE FROM custom_field_definitions WHERE org_id = ?')
-    .bind(orgId)
-    .run();
-  
-  // Delete secret history
-  await c.env.DB.prepare(`
-    DELETE FROM secret_history 
-    WHERE secret_id IN (SELECT id FROM secrets WHERE org_id = ?)
-  `)
-    .bind(orgId)
-    .run();
-  
-  // Delete secrets
-  await c.env.DB.prepare('DELETE FROM secrets WHERE org_id = ?')
-    .bind(orgId)
-    .run();
-  
-  // Delete categories
-  await c.env.DB.prepare('DELETE FROM categories WHERE org_id = ?')
-    .bind(orgId)
-    .run();
-  
-  // Delete memberships
-  await c.env.DB.prepare('DELETE FROM memberships WHERE org_id = ?')
-    .bind(orgId)
-    .run();
-  
-  // Finally, delete the organization
-  await c.env.DB.prepare('DELETE FROM organizations WHERE id = ?')
-    .bind(orgId)
-    .run();
+  // Using batch operations for better performance - reduces DB roundtrips from 10+ to 1
+  await c.env.DB.batch([
+    // Delete share links
+    c.env.DB.prepare('DELETE FROM share_links WHERE org_id = ?').bind(orgId),
+    
+    // Delete emergency requests and contacts
+    c.env.DB.prepare('DELETE FROM emergency_requests WHERE org_id = ?').bind(orgId),
+    c.env.DB.prepare('DELETE FROM emergency_contacts WHERE org_id = ?').bind(orgId),
+    
+    // Delete organization settings
+    c.env.DB.prepare('DELETE FROM organization_settings WHERE org_id = ?').bind(orgId),
+    
+    // Delete custom field values and definitions
+    c.env.DB.prepare(`
+      DELETE FROM custom_field_values 
+      WHERE secret_id IN (SELECT id FROM secrets WHERE org_id = ?)
+    `).bind(orgId),
+    c.env.DB.prepare('DELETE FROM custom_field_definitions WHERE org_id = ?').bind(orgId),
+    
+    // Delete secret history
+    c.env.DB.prepare(`
+      DELETE FROM secret_history 
+      WHERE secret_id IN (SELECT id FROM secrets WHERE org_id = ?)
+    `).bind(orgId),
+    
+    // Delete secrets
+    c.env.DB.prepare('DELETE FROM secrets WHERE org_id = ?').bind(orgId),
+    
+    // Delete categories
+    c.env.DB.prepare('DELETE FROM categories WHERE org_id = ?').bind(orgId),
+    
+    // Delete memberships
+    c.env.DB.prepare('DELETE FROM memberships WHERE org_id = ?').bind(orgId),
+    
+    // Finally, delete the organization
+    c.env.DB.prepare('DELETE FROM organizations WHERE id = ?').bind(orgId),
+  ]);
   
   return c.json({ 
     success: true, 

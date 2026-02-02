@@ -6,7 +6,6 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
 import { BrowserRouter } from 'react-router-dom';
 
 // Test utilities
@@ -340,7 +339,7 @@ describe('PasswordGenerator', () => {
     await waitFor(() => {
       const password = passwordField?.textContent;
       expect(password).toBeDefined();
-      expect(password!.length).toBeGreaterThan(0);
+      expect(password).not.toBe('');
     });
   });
 

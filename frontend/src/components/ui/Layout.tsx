@@ -7,7 +7,7 @@
  * @module components/ui/Layout
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../lib/auth';
 import { useVault } from '../../hooks/useVault';

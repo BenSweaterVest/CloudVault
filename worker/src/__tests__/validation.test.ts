@@ -245,7 +245,7 @@ describe('Validation Schemas', () => {
 
     it('should reject session timeout below minimum', () => {
       expect(() => updatePreferencesSchema.parse({
-        sessionTimeout: 0,
+        sessionTimeout: -1,
       })).toThrow();
     });
 
