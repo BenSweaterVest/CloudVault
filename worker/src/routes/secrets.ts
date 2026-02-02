@@ -88,7 +88,7 @@ secretsRoutes.get('/:orgId/secrets', async (c) => {
   const categoryId = url.searchParams.get('categoryId');
   const secretType = url.searchParams.get('type');
   const favoritesOnly = url.searchParams.get('favorites') === 'true';
-  const search = url.searchParams.get('search')?.toLowerCase();
+  const search = url.searchParams.get('search');
   
   // Check access
   const membership = await checkOrgAccess(c.env.DB, user.id, orgId);
@@ -122,28 +122,30 @@ secretsRoutes.get('/:orgId/secrets', async (c) => {
     query += ' AND s.is_favorite = 1';
   }
   
+  // Server-side search filter for better performance
+  // Search across name, url, username_hint, and tags (these are NOT encrypted)
+  if (search) {
+    const searchPattern = `%${search}%`;
+    query += ` AND (
+      s.name LIKE ? COLLATE NOCASE OR 
+      s.url LIKE ? COLLATE NOCASE OR 
+      s.username_hint LIKE ? COLLATE NOCASE OR 
+      s.tags LIKE ? COLLATE NOCASE
+    )`;
+    params.push(searchPattern, searchPattern, searchPattern, searchPattern);
+  }
+  
   query += ' ORDER BY s.is_favorite DESC, s.name';
   
   const results = await c.env.DB.prepare(query)
     .bind(...params)
     .all<SecretRow & { category_name: string | null; category_color: string | null }>();
   
-  let secrets = results.results.map((s) => ({
+  const secrets = results.results.map((s) => ({
     ...mapSecretRow(s),
     categoryName: s.category_name,
     categoryColor: s.category_color,
   }));
-  
-  // Client-side search filter (since data is encrypted)
-  if (search) {
-    secrets = secrets.filter(
-      (s) =>
-        s.name.toLowerCase().includes(search) ||
-        s.url?.toLowerCase().includes(search) ||
-        s.usernameHint?.toLowerCase().includes(search) ||
-        s.tags.some((t) => String(t).toLowerCase().includes(search))
-    );
-  }
   
   return c.json(secrets);
 });
