@@ -8,6 +8,7 @@ import { Hono } from 'hono';
 import type { Env, Variables } from '../index';
 import { authMiddleware } from '../middleware/auth';
 import { createAuditLogger } from '../middleware/audit';
+import { checkOrgAccess } from '../lib/db-utils';
 
 /**
  * Safely parse JSON with fallback to null
@@ -36,13 +37,9 @@ auditRoutes.get('/:orgId/audit', async (c) => {
   const audit = createAuditLogger(c);
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -133,13 +130,9 @@ auditRoutes.get('/:orgId/audit/export', async (c) => {
   const audit = createAuditLogger(c);
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -221,13 +214,9 @@ auditRoutes.get('/:orgId/audit/stats', async (c) => {
   const orgId = c.req.param('orgId');
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   

@@ -9,6 +9,7 @@ import { Hono } from 'hono';
 import type { Env, Variables } from '../index';
 import { authMiddleware } from '../middleware/auth';
 import { createAuditLogger } from '../middleware/audit';
+import { checkOrgAccess } from '../lib/db-utils';
 import { z } from 'zod';
 import { validateBody } from '../lib/validation';
 
@@ -127,13 +128,9 @@ sharingRoutes.post(
     const audit = createAuditLogger(c);
 
     // Check membership and that user has write access
-    const membership = await c.env.DB.prepare(
-      'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-    )
-      .bind(user.id, orgId, 'active')
-      .first<{ role: string }>();
+    const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'member');
 
-    if (!membership || membership.role === 'read_only') {
+    if (!membership) {
       return c.json({ error: 'Write access required to create share links' }, 403);
     }
 
@@ -236,11 +233,7 @@ sharingRoutes.get(
     const secretId = c.req.param('secretId');
 
     // Check membership
-    const membership = await c.env.DB.prepare(
-      'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-    )
-      .bind(user.id, orgId, 'active')
-      .first<{ role: string }>();
+    const membership = await checkOrgAccess(c.env.DB, user.id, orgId);
 
     if (!membership) {
       return c.json({ error: 'Access denied' }, 403);
@@ -302,13 +295,9 @@ sharingRoutes.delete(
     const audit = createAuditLogger(c);
 
     // Check membership
-    const membership = await c.env.DB.prepare(
-      'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-    )
-      .bind(user.id, orgId, 'active')
-      .first<{ role: string }>();
+    const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'member');
 
-    if (!membership || membership.role === 'read_only') {
+    if (!membership) {
       return c.json({ error: 'Write access required' }, 403);
     }
 

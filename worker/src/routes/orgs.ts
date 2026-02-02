@@ -8,6 +8,7 @@ import { Hono } from 'hono';
 import type { Env, Variables } from '../index';
 import { authMiddleware } from '../middleware/auth';
 import { createAuditLogger } from '../middleware/audit';
+import { checkOrgAccess } from '../lib/db-utils';
 
 export const orgsRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
 
@@ -116,11 +117,7 @@ orgsRoutes.get('/:orgId', async (c) => {
   const orgId = c.req.param('orgId');
   
   // Check membership
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId);
   
   if (!membership) {
     return c.json({ error: 'Not a member of this organization' }, 403);
@@ -154,13 +151,9 @@ orgsRoutes.get('/:orgId/members', async (c) => {
   const orgId = c.req.param('orgId');
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -218,13 +211,9 @@ orgsRoutes.post('/:orgId/members', async (c) => {
   const audit = createAuditLogger(c);
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -301,13 +290,9 @@ orgsRoutes.post('/:orgId/members/:userId/approve', async (c) => {
   const audit = createAuditLogger(c);
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -365,13 +350,9 @@ orgsRoutes.patch('/:orgId/members/:userId', async (c) => {
   const audit = createAuditLogger(c);
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -412,13 +393,9 @@ orgsRoutes.delete('/:orgId/members/:userId', async (c) => {
   const audit = createAuditLogger(c);
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   
@@ -474,13 +451,9 @@ orgsRoutes.delete('/:orgId', async (c) => {
   const audit = createAuditLogger(c);
   
   // Check admin access
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   

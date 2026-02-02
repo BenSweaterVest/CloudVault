@@ -7,6 +7,7 @@
 import { Hono } from 'hono';
 import type { Env, Variables } from '../index';
 import { authMiddleware } from '../middleware/auth';
+import { checkOrgAccess } from '../lib/db-utils';
 
 export const usersRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
 
@@ -22,13 +23,9 @@ usersRoutes.get('/:orgId/users/:userId/public-key', async (c) => {
   const userId = c.req.param('userId');
   
   // Check that requester is admin of the org
-  const membership = await c.env.DB.prepare(
-    'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-  )
-    .bind(user.id, orgId, 'active')
-    .first<{ role: string }>();
+  const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
   
-  if (!membership || membership.role !== 'admin') {
+  if (!membership) {
     return c.json({ error: 'Admin access required' }, 403);
   }
   

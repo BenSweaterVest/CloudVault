@@ -9,6 +9,7 @@ import { Hono } from 'hono';
 import type { Env, Variables } from '../index';
 import { authMiddleware } from '../middleware/auth';
 import { createAuditLogger } from '../middleware/audit';
+import { checkOrgAccess } from '../lib/db-utils';
 import { z } from 'zod';
 import { validateBody } from '../lib/validation';
 
@@ -41,13 +42,9 @@ emergencyRoutes.get(
     const orgId = c.req.param('orgId');
 
     // Check admin access
-    const membership = await c.env.DB.prepare(
-      'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-    )
-      .bind(user.id, orgId, 'active')
-      .first<{ role: string }>();
+    const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
 
-    if (!membership || membership.role !== 'admin') {
+    if (!membership) {
       return c.json({ error: 'Admin access required' }, 403);
     }
 
@@ -98,11 +95,7 @@ emergencyRoutes.post(
     const audit = createAuditLogger(c);
 
     // Check membership (any active member can set up emergency contact)
-    const membership = await c.env.DB.prepare(
-      'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-    )
-      .bind(user.id, orgId, 'active')
-      .first<{ role: string }>();
+    const membership = await checkOrgAccess(c.env.DB, user.id, orgId);
 
     if (!membership) {
       return c.json({ error: 'Not a member of this organization' }, 403);
@@ -175,11 +168,7 @@ emergencyRoutes.delete(
     const audit = createAuditLogger(c);
 
     // Check membership
-    const membership = await c.env.DB.prepare(
-      'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-    )
-      .bind(user.id, orgId, 'active')
-      .first<{ role: string }>();
+    const membership = await checkOrgAccess(c.env.DB, user.id, orgId);
 
     if (!membership) {
       return c.json({ error: 'Not a member of this organization' }, 403);
@@ -230,13 +219,9 @@ emergencyRoutes.get(
     const orgId = c.req.param('orgId');
 
     // Check admin access
-    const membership = await c.env.DB.prepare(
-      'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-    )
-      .bind(user.id, orgId, 'active')
-      .first<{ role: string }>();
+    const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
 
-    if (!membership || membership.role !== 'admin') {
+    if (!membership) {
       return c.json({ error: 'Admin access required' }, 403);
     }
 
@@ -366,13 +351,9 @@ emergencyRoutes.post(
     const audit = createAuditLogger(c);
 
     // Check admin access
-    const membership = await c.env.DB.prepare(
-      'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-    )
-      .bind(user.id, orgId, 'active')
-      .first<{ role: string }>();
+    const membership = await checkOrgAccess(c.env.DB, user.id, orgId, 'admin');
 
-    if (!membership || membership.role !== 'admin') {
+    if (!membership) {
       return c.json({ error: 'Admin access required' }, 403);
     }
 
