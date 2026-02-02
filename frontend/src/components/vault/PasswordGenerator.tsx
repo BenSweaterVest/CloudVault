@@ -83,7 +83,7 @@ export default function PasswordGenerator({ onSelect, onClose }: PasswordGenerat
       { enabled: options.uppercase, regex: /[A-Z]/, set: options.excludeAmbiguous ? CHAR_SETS.uppercaseUnambiguous : CHAR_SETS.uppercase },
       { enabled: options.lowercase, regex: /[a-z]/, set: options.excludeAmbiguous ? CHAR_SETS.lowercaseUnambiguous : CHAR_SETS.lowercase },
       { enabled: options.numbers, regex: /[0-9]/, set: options.excludeAmbiguous ? CHAR_SETS.numbersUnambiguous : CHAR_SETS.numbers },
-      { enabled: options.symbols, regex: /[!@#$%^&*()_+\-=\[\]{}|;:,.<>?]/, set: options.customSymbols || CHAR_SETS.symbols },
+      { enabled: options.symbols, regex: /[!@#$%^&*()_+\-=[\]{}|;:,.<>?]/, set: options.customSymbols || CHAR_SETS.symbols },
     ];
     
     for (const check of checks) {

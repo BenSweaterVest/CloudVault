@@ -191,7 +191,7 @@ export default function UserManagement() {
                   autoFocus
                 />
                 <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">
-                  They'll receive an email to set up their account. You'll need to approve them once they've completed setup.
+                  They&apos;ll receive an email to set up their account. You&apos;ll need to approve them once they&apos;ve completed setup.
                 </p>
                 <div className="mt-4 flex justify-end space-x-3">
                   <button
