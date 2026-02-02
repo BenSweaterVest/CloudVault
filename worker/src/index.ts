@@ -257,7 +257,7 @@ app.onError((err, c) => {
   
   // For 4xx errors, message is usually safe to expose
   if (status >= 400 && status < 500) {
-    return c.json({ error: err.message || 'Bad Request' }, status);
+    return c.json({ error: err.message || 'Bad Request' }, status as 400 | 401 | 403 | 404 | 429 | 500);
   }
   
   // For 5xx errors, don't expose internal error details

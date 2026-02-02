@@ -26,9 +26,10 @@ const createShareLinkSchema = z.object({
   recipientEmail: z.string().email().optional(),
 });
 
-const accessShareLinkSchema = z.object({
-  password: z.string().optional(),
-});
+// Schema for accessing share links (currently unused but kept for future feature)
+// const accessShareLinkSchema = z.object({
+//   password: z.string().optional(),
+// });
 
 // ============================================
 // PASSWORD HASHING HELPERS

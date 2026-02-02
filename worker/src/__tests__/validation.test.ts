@@ -14,7 +14,6 @@ import {
   updatePreferencesSchema,
   secretTypeSchema,
   ValidationError,
-  updateCategorySchema,
 } from '../lib/validation';
 
 describe('Validation Schemas', () => {

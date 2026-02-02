@@ -171,7 +171,7 @@ secretsRoutes.get('/:orgId/secrets', async (c) => {
         s.name.toLowerCase().includes(search) ||
         s.url?.toLowerCase().includes(search) ||
         s.usernameHint?.toLowerCase().includes(search) ||
-        s.tags.some((t: string) => t.toLowerCase().includes(search))
+        s.tags.some((t) => String(t).toLowerCase().includes(search))
     );
   }
   
@@ -631,7 +631,7 @@ secretsRoutes.get('/:orgId/secrets/export', async (c) => {
       categoryName: s.category_name,
       tags: s.tags ? JSON.parse(s.tags) : [],
       expiresAt: s.expires_at,
-      createdAt: s.created_at,
+      createdBy: s.created_by,
     })),
   };
   
