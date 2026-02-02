@@ -53,21 +53,31 @@ auditRoutes.get('/:orgId/audit', async (c) => {
   const action = url.searchParams.get('action');
   const userId = url.searchParams.get('userId');
   
-  // Build query
-  let query = 'SELECT * FROM audit_logs WHERE org_id = ?';
+  // Build WHERE clause (shared by both data and count queries)
+  let whereClause = 'WHERE org_id = ?';
   const params: (string | number)[] = [orgId];
   
   if (action) {
-    query += ' AND action = ?';
+    whereClause += ' AND action = ?';
     params.push(action);
   }
   
   if (userId) {
-    query += ' AND user_id = ?';
+    whereClause += ' AND user_id = ?';
     params.push(userId);
   }
   
-  query += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?';
+  // Use window function to get both results and count in a single query
+  // This eliminates the need for a separate COUNT query
+  const query = `
+    SELECT 
+      *,
+      COUNT(*) OVER() as total_count
+    FROM audit_logs 
+    ${whereClause}
+    ORDER BY timestamp DESC 
+    LIMIT ? OFFSET ?
+  `;
   params.push(limit, offset);
   
   const results = await c.env.DB.prepare(query)
@@ -84,25 +94,11 @@ auditRoutes.get('/:orgId/audit', async (c) => {
       metadata: string | null;
       ip_address: string | null;
       timestamp: string;
+      total_count: number;
     }>();
   
-  // Get total count
-  let countQuery = 'SELECT COUNT(*) as count FROM audit_logs WHERE org_id = ?';
-  const countParams: (string | number)[] = [orgId];
-  
-  if (action) {
-    countQuery += ' AND action = ?';
-    countParams.push(action);
-  }
-  
-  if (userId) {
-    countQuery += ' AND user_id = ?';
-    countParams.push(userId);
-  }
-  
-  const countResult = await c.env.DB.prepare(countQuery)
-    .bind(...countParams)
-    .first<{ count: number }>();
+  // Extract total count from first row (or 0 if no results)
+  const totalCount = results.results.length > 0 ? results.results[0].total_count : 0;
   
   // Log that audit was viewed
   audit.log('VIEW_AUDIT_LOG', {
@@ -124,7 +120,7 @@ auditRoutes.get('/:orgId/audit', async (c) => {
       ipAddress: log.ip_address,
       timestamp: log.timestamp,
     })),
-    total: countResult?.count || 0,
+    total: totalCount,
   });
 });
 
