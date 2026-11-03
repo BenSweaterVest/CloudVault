@@ -1,392 +1,325 @@
 /**
- * Zod Validation Schemas
- * 
- * Centralized validation schemas for all API endpoints.
- * All schemas include custom error messages for better API responses.
- * 
- * @module lib/validation
- * 
- * @example
- * ```typescript
- * import { createSecretSchema, validateBody } from './validation';
- * 
- * app.post('/secrets', async (c) => {
- *   const data = await validateBody(c, createSecretSchema);
- *   // data is now typed and validated
- * });
- * ```
+ * Request validation schemas (Zod).
+ *
+ * Every route that reads a body or query string validates it here. Size
+ * limits keep a single request well inside the Workers free plan budget.
  */
 
 import { z } from 'zod';
+import type { Context } from 'hono';
+import { AUDIT_ACTIONS } from '../middleware/audit';
 
 // ============================================
-// COMMON SCHEMAS
+// PRIMITIVES
 // ============================================
 
-/** UUID v4 format validation */
 export const uuidSchema = z.string().uuid();
+export const emailSchema = z.string().trim().toLowerCase().email().max(254);
+export const roleSchema = z.enum(['admin', 'member', 'read_only']);
 
-/** Email validation with automatic lowercase normalization */
-export const emailSchema = z.string().email().toLowerCase();
+/** Base64 (standard alphabet, padded) */
+const base64 = (max: number) =>
+  z.string().min(1).max(max).regex(/^[A-Za-z0-9+/]+={0,2}$/, 'Must be base64');
 
-/** Non-empty string with 1000 char max (for general text fields) */
-export const nonEmptyString = z.string().min(1).max(1000);
+/** Lowercase hex */
+const hex = (max: number) =>
+  z.string().min(1).max(max).regex(/^[0-9a-f]+$/, 'Must be lowercase hex');
+
+/** AES-GCM IV: 12 bytes as hex */
+export const ivSchema = z.string().regex(/^[0-9a-f]{24}$/, 'IV must be 12 bytes of hex');
+
+/** Encrypted payload: up to ~128 KB of ciphertext */
+export const ciphertextSchema = hex(262_144);
+
+/** RSA-OAEP encrypted org key (base64) */
+export const encryptedOrgKeySchema = base64(2048);
+
+/** Secret encryption format. 1 = legacy, 2 = bound with associated data. */
+export const encVersionSchema = z.union([z.literal(1), z.literal(2)]);
+
+/** http(s) URL or empty string. Other schemes (javascript:, data:) are rejected. */
+export const webUrlSchema = z
+  .string()
+  .trim()
+  .max(2048)
+  .refine((value) => {
+    if (value === '') return true;
+    try {
+      const url = new URL(value);
+      return url.protocol === 'http:' || url.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  }, 'URL must start with http:// or https://');
+
+export const kdfIterationsSchema = z.number().int().min(100_000).max(10_000_000);
 
 // ============================================
-// AUTH SCHEMAS
+// AUTH
 // ============================================
 
-/**
- * GitHub OAuth callback validation
- * @property {string} code - GitHub authorization code from OAuth redirect
- */
 export const githubCallbackSchema = z.object({
-  code: z.string().min(1, 'Authorization code is required'),
+  code: z.string().min(1, 'Authorization code is required').max(512),
 });
 
-/**
- * Magic link request validation
- * @property {string} email - User's email address
- */
 export const magicLinkRequestSchema = z.object({
   email: emailSchema,
 });
 
-/**
- * Magic link verification validation
- * @property {string} token - UUID token from magic link email
- */
 export const magicLinkVerifySchema = z.object({
-  token: z.string().uuid('Invalid token format'),
+  token: z.string().regex(/^[A-Za-z0-9_-]{32,128}$/, 'Invalid token format'),
 });
 
-/**
- * User key setup validation (during first login)
- * @property {string} publicKey - Base64-encoded RSA public key
- * @property {string} encryptedPrivateKey - Encrypted RSA private key
- * @property {string} salt - PBKDF2 salt for key derivation
- */
 export const setupKeysSchema = z.object({
-  publicKey: z.string().min(1, 'Public key is required'),
-  encryptedPrivateKey: z.string().min(1, 'Encrypted private key is required'),
-  salt: z.string().min(1, 'Salt is required'),
+  publicKey: base64(4096),
+  encryptedPrivateKey: base64(16_384),
+  salt: base64(128),
+  kdfIterations: kdfIterationsSchema.optional().default(100_000),
+});
+
+export const changeMasterPasswordSchema = z.object({
+  encryptedPrivateKey: base64(16_384),
+  salt: base64(128),
+  kdfIterations: kdfIterationsSchema,
+});
+
+export const updateProfileSchema = z.object({
+  name: z.string().trim().min(1).max(100).nullable(),
 });
 
 // ============================================
-// ORGANIZATION SCHEMAS
+// ORGANIZATIONS AND MEMBERS
 // ============================================
 
-/**
- * Organization creation validation
- * @property {string} name - Organization display name (1-100 chars)
- * @property {string} encryptedOrgKey - AES key encrypted with creator's public key
- */
+export const orgNameSchema = z.string().trim().min(1, 'Name is required').max(100, 'Name too long');
+
 export const createOrgSchema = z.object({
-  name: z.string().min(1, 'Name is required').max(100, 'Name too long'),
-  encryptedOrgKey: z.string().min(1, 'Encrypted org key is required'),
+  name: orgNameSchema,
+  encryptedOrgKey: encryptedOrgKeySchema,
 });
 
-/**
- * User invitation validation
- * @property {string} email - Email address to invite
- * @property {string} [role='member'] - Role to assign: 'admin', 'member', or 'read_only'
- */
+export const updateOrgSchema = z.object({
+  name: orgNameSchema,
+});
+
 export const inviteUserSchema = z.object({
   email: emailSchema,
-  role: z.enum(['admin', 'member', 'read_only']).optional().default('member'),
+  role: roleSchema.optional().default('member'),
 });
 
-/**
- * User approval validation (admin grants access)
- * @property {string} encryptedOrgKey - Org key encrypted with new user's public key
- */
 export const approveUserSchema = z.object({
-  encryptedOrgKey: z.string().min(1, 'Encrypted org key is required'),
+  encryptedOrgKey: encryptedOrgKeySchema,
 });
 
-/**
- * Role update validation
- * @property {string} role - New role: 'admin', 'member', or 'read_only'
- */
 export const updateRoleSchema = z.object({
-  role: z.enum(['admin', 'member', 'read_only']),
+  role: roleSchema,
 });
 
 // ============================================
-// SECRET SCHEMAS
+// SECRETS
 // ============================================
 
-/**
- * Valid secret types
- * - password: Login credentials
- * - note: Secure text notes
- * - api_key: API keys and tokens
- * - card: Payment card information
- * - totp: Two-factor authentication codes
- */
 export const secretTypeSchema = z.enum(['password', 'note', 'api_key', 'card', 'totp']);
 
-/**
- * Secret creation validation
- * @property {string} name - Display name (1-200 chars)
- * @property {string} [url] - Associated URL (optional)
- * @property {string} [usernameHint] - Unencrypted username for search
- * @property {string} ciphertextBlob - AES-256-GCM encrypted data (base64)
- * @property {string} iv - Initialization vector (base64)
- * @property {string} [categoryId] - Category UUID (optional)
- * @property {string} [secretType='password'] - Type of secret
- * @property {string[]} [tags] - Tags for organization (max 10)
- * @property {string} [expiresAt] - ISO 8601 expiration date
- */
+const tagsSchema = z.array(z.string().trim().min(1).max(50)).max(20);
+
 export const createSecretSchema = z.object({
-  name: z.string().min(1, 'Name is required').max(200, 'Name too long'),
-  url: z.string().url().optional().or(z.literal('')),
+  /** Client-generated id, required for encVersion 2 (it is bound into the ciphertext). */
+  id: uuidSchema.optional(),
+  name: z.string().trim().min(1, 'Name is required').max(200, 'Name too long'),
+  url: webUrlSchema.optional(),
   usernameHint: z.string().max(200).optional(),
-  ciphertextBlob: z.string().min(1, 'Encrypted data is required'),
-  iv: z.string().min(1, 'IV is required'),
-  categoryId: z.string().uuid().optional().nullable(),
+  ciphertextBlob: ciphertextSchema,
+  iv: ivSchema,
+  encVersion: encVersionSchema.optional().default(1),
+  categoryId: uuidSchema.optional().nullable(),
   secretType: secretTypeSchema.optional().default('password'),
-  tags: z.array(z.string().max(50)).max(10).optional(),
+  tags: tagsSchema.optional(),
   expiresAt: z.string().datetime().optional().nullable(),
 });
 
-/**
- * Secret update validation (all fields optional)
- * Same fields as createSecretSchema but all optional for partial updates.
- */
-export const updateSecretSchema = z.object({
-  name: z.string().min(1).max(200).optional(),
-  url: z.string().url().optional().or(z.literal('')),
-  usernameHint: z.string().max(200).optional(),
-  ciphertextBlob: z.string().min(1).optional(),
-  iv: z.string().min(1).optional(),
-  categoryId: z.string().uuid().optional().nullable(),
-  secretType: secretTypeSchema.optional(),
-  tags: z.array(z.string().max(50)).max(10).optional(),
-  expiresAt: z.string().datetime().optional().nullable(),
-  isFavorite: z.boolean().optional(),
-});
+export const updateSecretSchema = z
+  .object({
+    name: z.string().trim().min(1).max(200).optional(),
+    url: webUrlSchema.optional(),
+    usernameHint: z.string().max(200).optional(),
+    ciphertextBlob: ciphertextSchema.optional(),
+    iv: ivSchema.optional(),
+    encVersion: encVersionSchema.optional(),
+    categoryId: uuidSchema.optional().nullable(),
+    secretType: secretTypeSchema.optional(),
+    tags: tagsSchema.optional(),
+    expiresAt: z.string().datetime().optional().nullable(),
+    /** Version the client edited. If set and stale, the update is rejected (409). */
+    expectedVersion: z.number().int().min(1).optional(),
+  })
+  .refine((d) => (d.ciphertextBlob === undefined) === (d.iv === undefined), {
+    message: 'ciphertextBlob and iv must be updated together',
+  });
 
-/**
- * Toggle favorite status
- * @property {boolean} isFavorite - Whether to mark as favorite
- */
 export const toggleFavoriteSchema = z.object({
   isFavorite: z.boolean(),
 });
 
+export const importSecretsSchema = z.object({
+  secrets: z.array(createSecretSchema).min(1, 'No secrets to import').max(500, 'Import limit is 500 secrets per request'),
+  categoryId: uuidSchema.optional().nullable(),
+});
+
 // ============================================
-// CATEGORY SCHEMAS
+// CATEGORIES
 // ============================================
 
-/**
- * Category creation validation
- * @property {string} name - Category name (1-50 chars)
- * @property {string} [icon='folder'] - Icon identifier
- * @property {string} [color='#6366f1'] - Hex color code
- */
+const colorSchema = z.string().regex(/^#[0-9A-Fa-f]{6}$/, 'Invalid color format');
+const iconSchema = z.string().regex(/^[a-z0-9-]{1,50}$/, 'Invalid icon');
+
 export const createCategorySchema = z.object({
-  name: z.string().min(1, 'Name is required').max(50, 'Name too long'),
-  icon: z.string().max(50).optional().default('folder'),
-  color: z.string().regex(/^#[0-9A-Fa-f]{6}$/, 'Invalid color format').optional().default('#6366f1'),
+  name: z.string().trim().min(1, 'Name is required').max(50, 'Name too long'),
+  icon: iconSchema.optional().default('folder'),
+  color: colorSchema.optional().default('#6366f1'),
 });
 
-/**
- * Category update validation (all fields optional)
- * @property {string} [name] - Category name
- * @property {string} [icon] - Icon identifier
- * @property {string} [color] - Hex color code
- * @property {number} [sortOrder] - Display order (0+)
- */
 export const updateCategorySchema = z.object({
-  name: z.string().min(1).max(50).optional(),
-  icon: z.string().max(50).optional(),
-  color: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional(),
-  sortOrder: z.number().int().min(0).optional(),
+  name: z.string().trim().min(1).max(50).optional(),
+  icon: iconSchema.optional(),
+  color: colorSchema.optional(),
+  sortOrder: z.number().int().min(0).max(10_000).optional(),
 });
 
 // ============================================
-// USER PREFERENCES SCHEMAS
+// PREFERENCES AND ORG SETTINGS
 // ============================================
 
-/**
- * User preferences update validation
- * @property {string} [theme] - UI theme: 'light', 'dark', or 'system'
- * @property {number} [sessionTimeout] - Minutes until auto-lock (0=never, 1-120)
- * @property {number} [clipboardClear] - Seconds until clipboard clear (0-300, 0=disabled)
- * @property {boolean} [showFavicons] - Show website favicons
- * @property {boolean} [compactView] - Use compact list view
- */
 export const updatePreferencesSchema = z.object({
   theme: z.enum(['light', 'dark', 'system']).optional(),
-  sessionTimeout: z.number().int().min(0).max(120).optional(), // 0 = never timeout
-  clipboardClear: z.number().int().min(0).max(300).optional(),
+  sessionTimeout: z.number().int().min(0).max(1440).optional(), // minutes, 0 = never
+  clipboardClear: z.number().int().min(0).max(300).optional(), // seconds, 0 = never
   showFavicons: z.boolean().optional(),
   compactView: z.boolean().optional(),
 });
 
+export const updateOrgSettingsSchema = z.object({
+  minPasswordLength: z.number().int().min(8).max(128).optional(),
+  passwordExpiryDays: z.number().int().min(0).max(730).optional(),
+  allowShareLinks: z.boolean().optional(),
+  shareLinkMaxHours: z.number().int().min(1).max(720).optional(),
+  allowEmergencyAccess: z.boolean().optional(),
+  emergencyWaitMinHours: z.number().int().min(1).max(720).optional(),
+  auditRetentionDays: z.number().int().min(30).max(3650).optional(),
+});
+
 // ============================================
-// AUDIT LOG SCHEMAS
+// SHARING
 // ============================================
 
-/** Valid audit log action types */
-export const auditActionSchema = z.enum([
-  'LOGIN',
-  'LOGOUT',
-  'CREATE_ORG',
-  'DELETE_ORG',
-  'INVITE_USER',
-  'APPROVE_USER',
-  'REMOVE_USER',
-  'UPDATE_USER_ROLE',
-  'CREATE_SECRET',
-  'VIEW_SECRET',
-  'UPDATE_SECRET',
-  'DELETE_SECRET',
-  'CREATE_CATEGORY',
-  'UPDATE_CATEGORY',
-  'DELETE_CATEGORY',
-  'CREATE_SHARE_LINK',
-  'REVOKE_SHARE_LINK',
-  'ACCESS_SHARE_LINK',
-  'CREATE_EMERGENCY_CONTACT',
-  'REVOKE_EMERGENCY_CONTACT',
-  'REQUEST_EMERGENCY_ACCESS',
-  'DENY_EMERGENCY_ACCESS',
-  'VIEW_AUDIT_LOG',
-  'EXPORT_AUDIT_LOG',
-  'UPDATE_ORG_SETTINGS',
-]);
+export const createShareLinkSchema = z
+  .object({
+    /** Client-generated id, bound into the share ciphertext */
+    id: uuidSchema,
+    ciphertextBlob: ciphertextSchema,
+    iv: ivSchema,
+    expiresInHours: z.number().int().min(1).max(720),
+    maxViews: z.number().int().min(0).max(100).default(1), // 0 = unlimited
+    allowCopy: z.boolean().default(true),
+    recipientEmail: emailSchema.optional(),
+    /** Optional password gate: salt and SHA-256 of a client-derived token (hex) */
+    accessSalt: base64(64).optional(),
+    accessVerifier: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  })
+  .refine((d) => (d.accessSalt === undefined) === (d.accessVerifier === undefined), {
+    message: 'accessSalt and accessVerifier must be provided together',
+  });
 
-/**
- * Audit log query validation
- * @property {number} [limit=50] - Results per page (1-100)
- * @property {number} [offset=0] - Pagination offset
- * @property {string} [action] - Filter by action type (must be valid action)
- * @property {string} [userId] - Filter by user UUID
- * @property {string} [startDate] - ISO 8601 start date
- * @property {string} [endDate] - ISO 8601 end date
- */
+export const accessShareLinkSchema = z.object({
+  /** Client-derived access token (hex). Required when the link has a password. */
+  accessToken: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+});
+
+// ============================================
+// EMERGENCY ACCESS
+// ============================================
+
+export const addEmergencyContactSchema = z.object({
+  contactEmail: emailSchema,
+  contactName: z.string().trim().min(1).max(100).optional(),
+  waitTimeHours: z.number().int().min(1).max(720),
+  /** Org key encrypted for the contact's public key */
+  encryptedOrgKey: encryptedOrgKeySchema,
+});
+
+export const requestEmergencyAccessSchema = z.object({
+  reason: z.string().trim().min(10).max(500),
+});
+
+// ============================================
+// KEY ROTATION
+// ============================================
+
+export const rotateOrgKeySchema = z.object({
+  /** The key version the client rotated from (optimistic concurrency) */
+  fromKeyVersion: z.number().int().min(1),
+  secrets: z
+    .array(z.object({ id: uuidSchema, ciphertextBlob: ciphertextSchema, iv: ivSchema, encVersion: encVersionSchema }))
+    .max(2000),
+  history: z
+    .array(z.object({ id: z.number().int(), ciphertextBlob: ciphertextSchema, iv: ivSchema, encVersion: encVersionSchema }))
+    .max(10_000),
+  memberKeys: z.array(z.object({ userId: uuidSchema, encryptedOrgKey: encryptedOrgKeySchema })).min(1).max(1000),
+  emergencyKeys: z
+    .array(z.object({ contactId: uuidSchema, encryptedOrgKey: encryptedOrgKeySchema }))
+    .max(1000)
+    .default([]),
+});
+
+// ============================================
+// AUDIT
+// ============================================
+
+export const auditActionSchema = z.enum(AUDIT_ACTIONS);
+
 export const auditLogQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).optional().default(50),
   offset: z.coerce.number().int().min(0).optional().default(0),
   action: auditActionSchema.optional(),
-  userId: z.string().uuid().optional(),
+  userId: uuidSchema.optional(),
   startDate: z.string().datetime().optional(),
   endDate: z.string().datetime().optional(),
 });
 
 // ============================================
-// IMPORT/EXPORT SCHEMAS
+// HELPERS
 // ============================================
 
-/**
- * Secret import validation
- * @property {string} format - Source format: 'bitwarden_csv', 'lastpass_csv', 'generic_csv', 'cloudvault_json'
- * @property {string} data - Raw import data (CSV or JSON string)
- * @property {string} [categoryId] - Category to assign imported secrets
- */
-export const importSecretsSchema = z.object({
-  format: z.enum(['bitwarden_csv', 'lastpass_csv', 'generic_csv', 'cloudvault_json']),
-  data: z.string().min(1, 'Import data is required'),
-  categoryId: z.string().uuid().optional().nullable(),
-});
-
-// ============================================
-// VALIDATION HELPERS
-// ============================================
-
-import { Context } from 'hono';
-
-/**
- * Validate request body against a Zod schema
- * 
- * Parses the JSON request body and validates against the provided schema.
- * Throws ValidationError with detailed field-level messages on failure.
- * 
- * @template T - Zod schema type
- * @param {Context} c - Hono context object
- * @param {T} schema - Zod schema to validate against
- * @returns {Promise<z.infer<T>>} Validated and typed data
- * @throws {ValidationError} If validation fails
- * 
- * @example
- * ```typescript
- * const data = await validateBody(c, createSecretSchema);
- * // data is typed as { name: string, ciphertextBlob: string, ... }
- * ```
- */
-export async function validateBody<T extends z.ZodSchema>(
-  c: Context,
-  schema: T
-): Promise<z.infer<T>> {
-  try {
-    const body = await c.req.json();
-    return schema.parse(body);
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      const messages = error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
-      throw new ValidationError(messages);
-    }
-    throw new ValidationError('Invalid request body');
-  }
-}
-
-/**
- * Validate query parameters against a Zod schema
- * 
- * Parses URL query parameters and validates against the provided schema.
- * Useful for GET requests with filters/pagination.
- * 
- * @template T - Zod schema type
- * @param {Context} c - Hono context object
- * @param {T} schema - Zod schema to validate against
- * @returns {z.infer<T>} Validated and typed query params
- * @throws {ValidationError} If validation fails
- * 
- * @example
- * ```typescript
- * const query = validateQuery(c, auditLogQuerySchema);
- * // query is typed as { limit: number, offset: number, ... }
- * ```
- */
-export function validateQuery<T extends z.ZodSchema>(
-  c: Context,
-  schema: T
-): z.infer<T> {
-  try {
-    const query = Object.fromEntries(new URL(c.req.url).searchParams);
-    return schema.parse(query);
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      const messages = error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ');
-      throw new ValidationError(messages);
-    }
-    throw new ValidationError('Invalid query parameters');
-  }
-}
-
-/**
- * Custom validation error
- * 
- * Thrown when request validation fails. Caught by error handler
- * and returned as 400 Bad Request with error details.
- * 
- * @extends Error
- * 
- * @example
- * ```typescript
- * throw new ValidationError('email: Invalid email format');
- * // Results in: { "error": "email: Invalid email format", "type": "validation" }
- * ```
- */
 export class ValidationError extends Error {
-  /**
-   * Create a validation error
-   * @param {string} message - Human-readable error message
-   */
   constructor(message: string) {
     super(message);
     this.name = 'ValidationError';
   }
+}
+
+function formatZodError(error: z.ZodError): string {
+  return error.errors
+    .map((e) => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message))
+    .join(', ');
+}
+
+/** Parse and validate a JSON body. Throws ValidationError (400). */
+export async function validateBody<T extends z.ZodTypeAny>(c: Context, schema: T): Promise<z.infer<T>> {
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    throw new ValidationError('Request body must be valid JSON');
+  }
+  const result = schema.safeParse(body);
+  if (!result.success) throw new ValidationError(formatZodError(result.error));
+  return result.data;
+}
+
+/** Validate query parameters. Throws ValidationError (400). */
+export function validateQuery<T extends z.ZodTypeAny>(c: Context, schema: T): z.infer<T> {
+  const query = Object.fromEntries(new URL(c.req.url).searchParams);
+  const result = schema.safeParse(query);
+  if (!result.success) throw new ValidationError(formatZodError(result.error));
+  return result.data;
 }

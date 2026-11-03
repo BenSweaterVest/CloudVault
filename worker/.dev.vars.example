@@ -22,6 +22,9 @@ RESEND_API_KEY=re_your_resend_api_key
 # Default: CloudVault <noreply@cloudvault.app>
 # EMAIL_FROM=YourApp <noreply@yourdomain.com>
 
+# Set to false to allow sign-in only for invited users (optional, default true)
+# ALLOW_SIGNUPS=true
+
 # Magic link expiration in minutes (optional)
 # Default: 15
 # MAGIC_LINK_EXPIRY_MINUTES=30

@@ -1,13 +1,13 @@
 {
   "name": "cloudvault-worker",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "db:migrate": "wrangler d1 execute cloudvault-db --local --file=./src/db/schema.sql",
-    "db:migrate:prod": "wrangler d1 execute cloudvault-db --file=./src/db/schema.sql",
-    "typecheck": "tsc --noEmit",
+    "db:migrate": "wrangler d1 migrations apply cloudvault-db --local",
+    "db:migrate:prod": "wrangler d1 migrations apply cloudvault-db --remote",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "lint": "eslint src --ext .ts",
     "lint:fix": "eslint src --ext .ts --fix",
     "test": "vitest",
@@ -21,6 +21,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20231218.0",
+    "@types/node": "^22.20.5",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
     "eslint": "^8.54.0",

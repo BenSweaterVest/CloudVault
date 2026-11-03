@@ -1,517 +1,288 @@
 /**
- * Secure Sharing Routes
- * 
- * Allows creating temporary, expiring share links for secrets.
- * Share links can be password-protected and view-limited.
+ * Share links: temporary, view-limited access to one secret for someone
+ * outside the vault.
+ *
+ * Zero-knowledge design:
+ *   1. The sharer's browser decrypts the secret, generates a random 256-bit
+ *      share key, and re-encrypts the secret with it (bound to the link id).
+ *   2. Only that share ciphertext is uploaded. The share key goes in the URL
+ *      fragment (#...), which browsers never send to the server.
+ *   3. Optional password: the browser derives an access token from the
+ *      password with PBKDF2 and uploads only SHA-256(token). The recipient's
+ *      browser derives the same token; the server compares hashes. No slow
+ *      hashing runs on the server, which keeps it inside the free plan's
+ *      10 ms CPU budget.
+ *
+ * Authenticated routes are mounted on the org router (/api/organizations);
+ * public routes on /api/share.
  */
 
 import { Hono } from 'hono';
-import type { Env, Variables } from '../index';
-import { authMiddleware } from '../middleware/auth';
-import { createAuditLogger } from '../middleware/audit';
-import { z } from 'zod';
-import { validateBody } from '../lib/validation';
+import type { AppEnv } from '../env';
+import { requireMembership } from '../lib/access';
+import { createAuditLogger, logAuditEvent } from '../middleware/audit';
+import { getClientIp, HttpError, param } from '../lib/http';
+import { sha256Hex, timingSafeEqual } from '../lib/crypto';
+import { accessShareLinkSchema, createShareLinkSchema, validateBody } from '../lib/validation';
+import { getOrgSettings } from './settings';
 
-export const sharingRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
+export const sharingRoutes = new Hono<AppEnv>();
+export const publicShareRoutes = new Hono<AppEnv>();
 
-// ============================================
-// VALIDATION SCHEMAS
-// ============================================
-
-const createShareLinkSchema = z.object({
-  expiresInHours: z.number().int().min(1).max(168), // 1 hour to 1 week
-  maxViews: z.number().int().min(0).max(100).default(1), // 0 = unlimited
-  accessPassword: z.string().min(4).max(100).optional(),
-  allowCopy: z.boolean().default(true),
-  recipientEmail: z.string().email().optional(),
-});
-
-// Schema for accessing share links (currently unused but kept for future feature)
-// const accessShareLinkSchema = z.object({
-//   password: z.string().optional(),
-// });
-
-// ============================================
-// PASSWORD HASHING HELPERS
-// ============================================
-
-const PBKDF2_ITERATIONS = 100000;
-const SALT_LENGTH = 16;
-
-/**
- * Hash a share link password using PBKDF2 with a random salt
- * Returns: salt:hash (both base64 encoded)
- */
-async function hashSharePassword(password: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
-  
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(password),
-    'PBKDF2',
-    false,
-    ['deriveBits']
-  );
-  
-  const hashBuffer = await crypto.subtle.deriveBits(
-    {
-      name: 'PBKDF2',
-      salt: salt,
-      iterations: PBKDF2_ITERATIONS,
-      hash: 'SHA-256',
-    },
-    keyMaterial,
-    256
-  );
-  
-  const saltBase64 = btoa(String.fromCharCode(...salt));
-  const hashBase64 = btoa(String.fromCharCode(...new Uint8Array(hashBuffer)));
-  
-  return `${saltBase64}:${hashBase64}`;
+function shareUrlBase(appUrl: string, linkId: string): string {
+  // The key fragment is appended by the client; the server never has it.
+  return `${new URL(appUrl).origin}/share/${linkId}`;
 }
 
-/**
- * Verify a password against a stored hash
- */
-async function verifySharePassword(password: string, storedHash: string): Promise<boolean> {
-  // Handle legacy unsalted hashes (backwards compatibility)
-  if (!storedHash.includes(':')) {
-    const encoder = new TextEncoder();
-    const passwordData = encoder.encode(password);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', passwordData);
-    const legacyHash = btoa(String.fromCharCode(...new Uint8Array(hashBuffer)));
-    return legacyHash === storedHash;
+// ============================================
+// AUTHENTICATED (org router)
+// ============================================
+
+sharingRoutes.post('/:orgId/secrets/:secretId/shares', async (c) => {
+  const orgId = param(c, 'orgId');
+  const secretId = param(c, 'secretId');
+  await requireMembership(c, orgId, 'member');
+  const user = c.get('user');
+
+  const settings = await getOrgSettings(c.env.DB, orgId);
+  if (!settings.allow_share_links) throw new HttpError(403, 'Share links are disabled for this organization');
+
+  const secret = await c.env.DB.prepare('SELECT name FROM secrets WHERE id = ? AND org_id = ?')
+    .bind(secretId, orgId)
+    .first<{ name: string }>();
+  if (!secret) throw new HttpError(404, 'Secret not found');
+
+  const data = await validateBody(c, createShareLinkSchema);
+  if (data.expiresInHours > settings.share_link_max_hours) {
+    throw new HttpError(400, `Share links cannot last longer than ${settings.share_link_max_hours} hours in this organization`);
   }
-  
-  const [saltBase64, expectedHashBase64] = storedHash.split(':');
-  const salt = Uint8Array.from(atob(saltBase64), c => c.charCodeAt(0));
-  
-  const encoder = new TextEncoder();
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(password),
-    'PBKDF2',
-    false,
-    ['deriveBits']
-  );
-  
-  const hashBuffer = await crypto.subtle.deriveBits(
-    {
-      name: 'PBKDF2',
-      salt: salt,
-      iterations: PBKDF2_ITERATIONS,
-      hash: 'SHA-256',
-    },
-    keyMaterial,
-    256
-  );
-  
-  const actualHashBase64 = btoa(String.fromCharCode(...new Uint8Array(hashBuffer)));
-  
-  return actualHashBase64 === expectedHashBase64;
-}
 
-// ============================================
-// AUTHENTICATED ROUTES (Create/Manage)
-// ============================================
-
-// Create a share link for a secret
-sharingRoutes.post(
-  '/:orgId/secrets/:secretId/share',
-  authMiddleware,
-  async (c) => {
-    const user = c.get('user')!;
-    const orgId = c.req.param('orgId');
-    const secretId = c.req.param('secretId');
-    const audit = createAuditLogger(c);
-
-    // Check membership and that user has write access
-    const membership = await c.env.DB.prepare(
-      'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
+  const expiresAt = new Date(Date.now() + data.expiresInHours * 3_600_000).toISOString();
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO share_links (id, secret_id, org_id, created_by, expires_at, max_views, allow_copy, recipient_email,
+                                ciphertext_blob, iv, access_salt, access_verifier)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-      .bind(user.id, orgId, 'active')
-      .first<{ role: string }>();
-
-    if (!membership || membership.role === 'read_only') {
-      return c.json({ error: 'Write access required to create share links' }, 403);
-    }
-
-    // Check org settings allow share links
-    const orgSettings = await c.env.DB.prepare(
-      'SELECT allow_share_links, share_link_max_hours FROM organization_settings WHERE org_id = ?'
-    )
-      .bind(orgId)
-      .first<{ allow_share_links: number; share_link_max_hours: number }>();
-
-    if (orgSettings && !orgSettings.allow_share_links) {
-      return c.json({ error: 'Share links are disabled for this organization' }, 403);
-    }
-
-    // Verify secret exists and belongs to org
-    const secret = await c.env.DB.prepare(
-      'SELECT id, name FROM secrets WHERE id = ? AND org_id = ?'
-    )
-      .bind(secretId, orgId)
-      .first<{ id: string; name: string }>();
-
-    if (!secret) {
-      return c.json({ error: 'Secret not found' }, 404);
-    }
-
-    const data = await validateBody(c, createShareLinkSchema);
-
-    // Enforce org max hours if set
-    const maxHours = orgSettings?.share_link_max_hours || 168;
-    if (data.expiresInHours > maxHours) {
-      return c.json({ error: `Share links cannot exceed ${maxHours} hours for this organization` }, 400);
-    }
-
-    const linkId = crypto.randomUUID();
-    const expiresAt = new Date(Date.now() + data.expiresInHours * 60 * 60 * 1000).toISOString();
-
-    // Hash password with salt if provided (PBKDF2)
-    let passwordHash: string | null = null;
-    if (data.accessPassword) {
-      passwordHash = await hashSharePassword(data.accessPassword);
-    }
-
-    await c.env.DB.prepare(`
-      INSERT INTO share_links (
-        id, secret_id, org_id, created_by, access_password_hash,
-        expires_at, max_views, allow_copy, recipient_email
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `)
       .bind(
-        linkId,
+        data.id,
         secretId,
         orgId,
-        user.id,
-        passwordHash,
+        user?.id ?? null,
         expiresAt,
         data.maxViews,
         data.allowCopy ? 1 : 0,
-        data.recipientEmail || null
+        data.recipientEmail ?? null,
+        data.ciphertextBlob,
+        data.iv,
+        data.accessSalt ?? null,
+        data.accessVerifier ?? null
       )
       .run();
+  } catch (err) {
+    if (err instanceof Error && /UNIQUE|PRIMARY KEY/i.test(err.message)) throw new HttpError(409, 'Share link id already exists');
+    throw err;
+  }
 
-    // Log share creation
-    audit.log('CREATE_SHARE_LINK', {
-      orgId,
-      targetType: 'secret',
-      targetId: secretId,
-      targetName: secret.name,
-      metadata: {
-        shareId: linkId,
-        expiresAt,
-        maxViews: data.maxViews,
-        hasPassword: !!passwordHash,
-        recipientEmail: data.recipientEmail,
-      },
-    });
+  createAuditLogger(c).log('CREATE_SHARE_LINK', {
+    orgId,
+    targetType: 'secret',
+    targetId: secretId,
+    targetName: secret.name,
+    metadata: { shareId: data.id, expiresAt, maxViews: data.maxViews, hasPassword: !!data.accessVerifier, recipientEmail: data.recipientEmail },
+  });
 
-    // Generate share URL
-    const shareUrl = `${c.env.APP_URL}/share/${linkId}`;
-
-    return c.json({
-      id: linkId,
-      url: shareUrl,
+  return c.json(
+    {
+      id: data.id,
+      url: shareUrlBase(c.env.APP_URL, data.id),
       expiresAt,
       maxViews: data.maxViews,
-      hasPassword: !!passwordHash,
+      viewCount: 0,
+      hasPassword: !!data.accessVerifier,
       allowCopy: data.allowCopy,
-      recipientEmail: data.recipientEmail,
-    });
-  }
-);
+      recipientEmail: data.recipientEmail ?? null,
+      isRevoked: false,
+    },
+    201
+  );
+});
 
-// List share links for a secret
-sharingRoutes.get(
-  '/:orgId/secrets/:secretId/shares',
-  authMiddleware,
-  async (c) => {
-    const user = c.get('user')!;
-    const orgId = c.req.param('orgId');
-    const secretId = c.req.param('secretId');
+sharingRoutes.get('/:orgId/secrets/:secretId/shares', async (c) => {
+  const orgId = param(c, 'orgId');
+  const secretId = param(c, 'secretId');
+  await requireMembership(c, orgId);
 
-    // Check membership
-    const membership = await c.env.DB.prepare(
-      'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-    )
-      .bind(user.id, orgId, 'active')
-      .first<{ role: string }>();
-
-    if (!membership) {
-      return c.json({ error: 'Access denied' }, 403);
-    }
-
-    const results = await c.env.DB.prepare(`
-      SELECT 
-        sl.*,
-        u.email as created_by_email
-      FROM share_links sl
-      JOIN users u ON sl.created_by = u.id
-      WHERE sl.secret_id = ? AND sl.org_id = ?
-      ORDER BY sl.created_at DESC
-    `)
-      .bind(secretId, orgId)
-      .all<{
-        id: string;
-        expires_at: string;
-        max_views: number;
-        view_count: number;
-        allow_copy: number;
-        recipient_email: string | null;
-        revoked: number;
-        created_at: string;
-        last_viewed_at: string | null;
-        created_by_email: string;
-        access_password_hash: string | null;
-      }>();
-
-    return c.json(
-      results.results.map((link) => ({
-        id: link.id,
-        url: `${c.env.APP_URL}/share/${link.id}`,
-        expiresAt: link.expires_at,
-        maxViews: link.max_views,
-        viewCount: link.view_count,
-        allowCopy: link.allow_copy === 1,
-        recipientEmail: link.recipient_email,
-        isRevoked: link.revoked === 1,
-        isExpired: new Date(link.expires_at) < new Date(),
-        isExhausted: link.max_views > 0 && link.view_count >= link.max_views,
-        hasPassword: !!link.access_password_hash,
-        createdAt: link.created_at,
-        lastViewedAt: link.last_viewed_at,
-        createdByEmail: link.created_by_email,
-      }))
-    );
-  }
-);
-
-// Revoke a share link
-sharingRoutes.delete(
-  '/:orgId/shares/:linkId',
-  authMiddleware,
-  async (c) => {
-    const user = c.get('user')!;
-    const orgId = c.req.param('orgId');
-    const linkId = c.req.param('linkId');
-    const audit = createAuditLogger(c);
-
-    // Check membership
-    const membership = await c.env.DB.prepare(
-      'SELECT role FROM memberships WHERE user_id = ? AND org_id = ? AND status = ?'
-    )
-      .bind(user.id, orgId, 'active')
-      .first<{ role: string }>();
-
-    if (!membership || membership.role === 'read_only') {
-      return c.json({ error: 'Write access required' }, 403);
-    }
-
-    // Get link details for audit
-    const link = await c.env.DB.prepare(`
-      SELECT sl.*, s.name as secret_name
-      FROM share_links sl
-      JOIN secrets s ON sl.secret_id = s.id
-      WHERE sl.id = ? AND sl.org_id = ?
-    `)
-      .bind(linkId, orgId)
-      .first<{ id: string; secret_id: string; secret_name: string }>();
-
-    if (!link) {
-      return c.json({ error: 'Share link not found' }, 404);
-    }
-
-    await c.env.DB.prepare('UPDATE share_links SET revoked = 1 WHERE id = ?')
-      .bind(linkId)
-      .run();
-
-    audit.log('REVOKE_SHARE_LINK', {
-      orgId,
-      targetType: 'secret',
-      targetId: link.secret_id,
-      targetName: link.secret_name,
-      metadata: { shareId: linkId },
-    });
-
-    return c.json({ success: true });
-  }
-);
-
-// ============================================
-// PUBLIC ROUTES (Access Share Link)
-// ============================================
-
-// Get share link info (public, no auth required)
-sharingRoutes.get('/public/:linkId', async (c) => {
-  const linkId = c.req.param('linkId');
-
-  const link = await c.env.DB.prepare(`
-    SELECT 
-      sl.id,
-      sl.expires_at,
-      sl.max_views,
-      sl.view_count,
-      sl.allow_copy,
-      sl.revoked,
-      sl.access_password_hash,
-      s.name as secret_name,
-      o.name as org_name
-    FROM share_links sl
-    JOIN secrets s ON sl.secret_id = s.id
-    JOIN organizations o ON sl.org_id = o.id
-    WHERE sl.id = ?
-  `)
-    .bind(linkId)
-    .first<{
+  const results = await c.env.DB.prepare(
+    `SELECT sl.id, sl.expires_at, sl.max_views, sl.view_count, sl.allow_copy, sl.recipient_email, sl.revoked,
+            sl.created_at, sl.last_viewed_at, sl.access_verifier, u.email AS created_by_email
+     FROM share_links sl LEFT JOIN users u ON sl.created_by = u.id
+     WHERE sl.secret_id = ? AND sl.org_id = ?
+     ORDER BY sl.created_at DESC`
+  )
+    .bind(secretId, orgId)
+    .all<{
       id: string;
       expires_at: string;
       max_views: number;
       view_count: number;
       allow_copy: number;
+      recipient_email: string | null;
       revoked: number;
-      access_password_hash: string | null;
-      secret_name: string;
-      org_name: string;
+      created_at: string;
+      last_viewed_at: string | null;
+      access_verifier: string | null;
+      created_by_email: string | null;
     }>();
 
-  if (!link) {
-    return c.json({ error: 'Share link not found' }, 404);
-  }
+  const now = Date.now();
+  return c.json(
+    results.results.map((link) => ({
+      id: link.id,
+      url: shareUrlBase(c.env.APP_URL, link.id),
+      expiresAt: link.expires_at,
+      maxViews: link.max_views,
+      viewCount: link.view_count,
+      allowCopy: link.allow_copy === 1,
+      recipientEmail: link.recipient_email,
+      isRevoked: link.revoked === 1,
+      isExpired: new Date(link.expires_at).getTime() < now,
+      isExhausted: link.max_views > 0 && link.view_count >= link.max_views,
+      hasPassword: !!link.access_verifier,
+      createdAt: link.created_at,
+      lastViewedAt: link.last_viewed_at,
+      createdByEmail: link.created_by_email,
+    }))
+  );
+});
 
-  // Check if valid
-  const isExpired = new Date(link.expires_at) < new Date();
-  const isExhausted = link.max_views > 0 && link.view_count >= link.max_views;
-  const isRevoked = link.revoked === 1;
+sharingRoutes.delete('/:orgId/shares/:linkId', async (c) => {
+  const orgId = param(c, 'orgId');
+  const linkId = param(c, 'linkId');
+  await requireMembership(c, orgId, 'member');
 
-  if (isRevoked) {
-    return c.json({ error: 'This share link has been revoked' }, 410);
-  }
+  const link = await c.env.DB.prepare(
+    `SELECT sl.secret_id, s.name AS secret_name FROM share_links sl JOIN secrets s ON sl.secret_id = s.id
+     WHERE sl.id = ? AND sl.org_id = ?`
+  )
+    .bind(linkId, orgId)
+    .first<{ secret_id: string; secret_name: string }>();
+  if (!link) throw new HttpError(404, 'Share link not found');
 
-  if (isExpired) {
-    return c.json({ error: 'This share link has expired' }, 410);
-  }
+  // Drop the ciphertext too: a revoked link should hold nothing useful.
+  await c.env.DB.prepare('UPDATE share_links SET revoked = 1, ciphertext_blob = NULL, iv = NULL WHERE id = ?').bind(linkId).run();
 
-  if (isExhausted) {
-    return c.json({ error: 'This share link has reached its view limit' }, 410);
-  }
+  createAuditLogger(c).log('REVOKE_SHARE_LINK', {
+    orgId,
+    targetType: 'secret',
+    targetId: link.secret_id,
+    targetName: link.secret_name,
+    metadata: { shareId: linkId },
+  });
+  return c.json({ success: true });
+});
 
+// ============================================
+// PUBLIC (/api/share)
+// ============================================
+
+interface PublicLinkRow {
+  id: string;
+  secret_id: string;
+  org_id: string;
+  expires_at: string;
+  max_views: number;
+  view_count: number;
+  allow_copy: number;
+  revoked: number;
+  access_salt: string | null;
+  access_verifier: string | null;
+  secret_name: string;
+  secret_type: string;
+  url: string | null;
+  org_name: string;
+}
+
+async function loadPublicLink(db: D1Database, linkId: string): Promise<PublicLinkRow> {
+  const link = await db
+    .prepare(
+      `SELECT sl.id, sl.secret_id, sl.org_id, sl.expires_at, sl.max_views, sl.view_count, sl.allow_copy, sl.revoked,
+              sl.access_salt, sl.access_verifier,
+              s.name AS secret_name, s.secret_type, s.url, o.name AS org_name
+       FROM share_links sl
+       JOIN secrets s ON sl.secret_id = s.id
+       JOIN organizations o ON sl.org_id = o.id
+       WHERE sl.id = ?`
+    )
+    .bind(linkId)
+    .first<PublicLinkRow>();
+
+  if (!link) throw new HttpError(404, 'Share link not found');
+  if (link.revoked) throw new HttpError(410, 'This share link has been revoked');
+  if (new Date(link.expires_at).getTime() <= Date.now()) throw new HttpError(410, 'This share link has expired');
+  if (link.max_views > 0 && link.view_count >= link.max_views) throw new HttpError(410, 'This share link has reached its view limit');
+  return link;
+}
+
+/** Link status, without consuming a view. */
+publicShareRoutes.get('/:linkId', async (c) => {
+  const link = await loadPublicLink(c.env.DB, param(c, 'linkId'));
   return c.json({
     secretName: link.secret_name,
     orgName: link.org_name,
-    requiresPassword: !!link.access_password_hash,
+    requiresPassword: !!link.access_verifier,
+    accessSalt: link.access_salt,
     allowCopy: link.allow_copy === 1,
     expiresAt: link.expires_at,
     remainingViews: link.max_views > 0 ? link.max_views - link.view_count : null,
   });
 });
 
-// Access shared secret (public, no auth required)
-sharingRoutes.post('/public/:linkId/access', async (c) => {
-  const linkId = c.req.param('linkId');
+/** Consume one view and return the share ciphertext. */
+publicShareRoutes.post('/:linkId/access', async (c) => {
+  const linkId = param(c, 'linkId');
+  const link = await loadPublicLink(c.env.DB, linkId);
+  const { accessToken } = await validateBody(c, accessShareLinkSchema);
 
-  const link = await c.env.DB.prepare(`
-    SELECT 
-      sl.*,
-      s.name as secret_name,
-      s.ciphertext_blob,
-      s.iv,
-      s.secret_type,
-      s.url,
-      o.id as org_id
-    FROM share_links sl
-    JOIN secrets s ON sl.secret_id = s.id
-    JOIN organizations o ON sl.org_id = o.id
-    WHERE sl.id = ?
-  `)
-    .bind(linkId)
-    .first<{
-      id: string;
-      secret_id: string;
-      org_id: string;
-      expires_at: string;
-      max_views: number;
-      view_count: number;
-      allow_copy: number;
-      revoked: number;
-      access_password_hash: string | null;
-      secret_name: string;
-      ciphertext_blob: string;
-      iv: string;
-      secret_type: string;
-      url: string | null;
-    }>();
-
-  if (!link) {
-    return c.json({ error: 'Share link not found' }, 404);
-  }
-
-  // Validate link status
-  if (link.revoked === 1) {
-    return c.json({ error: 'This share link has been revoked' }, 410);
-  }
-
-  if (new Date(link.expires_at) < new Date()) {
-    return c.json({ error: 'This share link has expired' }, 410);
-  }
-
-  if (link.max_views > 0 && link.view_count >= link.max_views) {
-    return c.json({ error: 'This share link has reached its view limit' }, 410);
-  }
-
-  // Verify password if required
-  if (link.access_password_hash) {
-    const body = await c.req.json().catch(() => ({}));
-    const password = body.password;
-
-    if (!password) {
-      return c.json({ error: 'Password required', requiresPassword: true }, 401);
-    }
-
-    const isValid = await verifySharePassword(password, link.access_password_hash);
-    if (!isValid) {
-      return c.json({ error: 'Invalid password' }, 401);
+  if (link.access_verifier) {
+    if (!accessToken) throw new HttpError(401, 'Password required', 'PASSWORD_REQUIRED');
+    if (!timingSafeEqual(await sha256Hex(accessToken), link.access_verifier)) {
+      throw new HttpError(401, 'Incorrect password', 'PASSWORD_INCORRECT');
     }
   }
 
-  // Increment view count
-  await c.env.DB.prepare(`
-    UPDATE share_links 
-    SET view_count = view_count + 1, last_viewed_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `)
-    .bind(linkId)
-    .run();
+  // Atomic: the view is only counted (and the payload only returned) if the
+  // link is still valid at the moment of the update.
+  const consumed = await c.env.DB.prepare(
+    `UPDATE share_links SET view_count = view_count + 1, last_viewed_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND revoked = 0 AND expires_at > ? AND (max_views = 0 OR view_count < max_views)
+     RETURNING ciphertext_blob, iv, allow_copy, view_count, max_views`
+  )
+    .bind(linkId, new Date().toISOString())
+    .first<{ ciphertext_blob: string | null; iv: string | null; allow_copy: number; view_count: number; max_views: number }>();
 
-  // Log access (anonymously in audit)
-  await c.env.DB.prepare(`
-    INSERT INTO audit_logs (org_id, action, target_type, target_id, target_name, metadata, ip_address, timestamp)
-    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-  `)
-    .bind(
-      link.org_id,
-      'ACCESS_SHARE_LINK',
-      'secret',
-      link.secret_id,
-      link.secret_name,
-      JSON.stringify({ shareId: linkId }),
-      c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || 'unknown'
-    )
-    .run();
+  if (!consumed || !consumed.ciphertext_blob || !consumed.iv) {
+    throw new HttpError(410, 'This share link is no longer available');
+  }
 
-  // Return the encrypted secret
-  // NOTE: The recipient will need the share-specific decryption key
-  // which should be included in the share URL as a fragment
+  await logAuditEvent(c.env.DB, {
+    orgId: link.org_id,
+    action: 'ACCESS_SHARE_LINK',
+    targetType: 'secret',
+    targetId: link.secret_id,
+    targetName: link.secret_name,
+    metadata: { shareId: linkId, viewNumber: consumed.view_count },
+    ipAddress: getClientIp(c),
+    userAgent: c.req.header('User-Agent'),
+  });
+
   return c.json({
     name: link.secret_name,
     url: link.url,
     secretType: link.secret_type,
-    ciphertextBlob: link.ciphertext_blob,
-    iv: link.iv,
-    allowCopy: link.allow_copy === 1,
+    ciphertextBlob: consumed.ciphertext_blob,
+    iv: consumed.iv,
+    allowCopy: consumed.allow_copy === 1,
+    remainingViews: consumed.max_views > 0 ? consumed.max_views - consumed.view_count : null,
   });
 });
