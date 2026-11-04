@@ -1,207 +1,95 @@
-# CloudVault FAQ
-
-Frequently asked questions about using CloudVault.
+# FAQ
 
 ## General
 
 ### What is CloudVault?
 
-CloudVault is a secure, zero-knowledge password manager that lets you store and share passwords with your team. "Zero-knowledge" means your passwords are encrypted on your device before being sent to our servers - we never see your actual passwords.
+A shared password vault for small organizations. Everyone in an organization can reach the passwords they need, every view is logged, and the passwords are encrypted in each person's browser so the server never sees them.
 
-### Is CloudVault free?
+### Who is it for?
 
-Yes! CloudVault runs on Cloudflare's free tier, making it completely free to host for small teams. You only pay if you exceed Cloudflare's generous free tier limits.
+Nonprofits, boards, clubs, volunteer groups and small teams who need to share logins (bank, payroll, social media, domain registrar, Wi-Fi) without emailing them around, and who want a record of who accessed what. It runs on Cloudflare's free plan.
 
-### Who is CloudVault for?
+### Is it really free?
 
-CloudVault is designed for:
-- Small businesses and startups
-- Non-profit organizations
-- Teams that need to share credentials securely
-- Anyone who wants full control over their password data
+The software is MIT licensed. Hosting fits Cloudflare's free plan for a typical small organization (see the [budget table](../README.md#free-plan-budget)). Emailed login links use Resend's free tier.
 
 ## Security
 
-### How secure is CloudVault?
+### How are my passwords protected?
 
-CloudVault uses industry-standard encryption:
-- **AES-256-GCM** for encrypting your passwords
-- **RSA-4096** for your personal encryption keys
-- **PBKDF2** with 100,000 iterations for key derivation
-- All encryption happens in your browser - unencrypted data never leaves your device
+Your master password unlocks your personal key on your device. That key unlocks your organization's key, which decrypts the items. All of this happens in your browser. The server stores only encrypted data. Details are in [SECURITY.md](SECURITY.md).
 
-### Can CloudVault staff see my passwords?
+### What can the server (or someone who steals the database) see?
 
-No. CloudVault is "zero-knowledge" - your passwords are encrypted before they reach our servers. Without your master password, your data is unreadable. Even if someone gained access to the database, they would only see encrypted gibberish.
+Item names, websites, usernames, categories, tags, expiry dates, email addresses and the audit log. It cannot see passwords, notes, card details, API keys, 2FA secrets or custom fields. Keep sensitive details out of item names.
 
-### What if I forget my master password?
+### I forgot my master password. Can an admin reset it?
 
-Unfortunately, we cannot recover your passwords if you forget your master password. This is by design - it's what makes CloudVault truly zero-knowledge. We recommend:
-- Using a memorable but strong passphrase
-- Writing down your master password and storing it in a safe place
-- Setting up emergency access contacts who can request access if needed
+No. Nobody can, which is what keeps your data private from the server and from admins. Sign in, set up a new master password (an admin may need to remove and re-invite you), and an admin can approve you again. Items in the shared vault are not lost; only your personal access is reset.
 
-### Is two-factor authentication (2FA) supported?
+### Why do I have to read a "fingerprint" to an admin?
 
-CloudVault supports storing TOTP 2FA codes for your other accounts. You can view real-time 2FA codes directly in CloudVault.
+When you join, the admin's browser encrypts the vault key for your public key. The fingerprint check confirms that the key the server handed the admin really is yours. Without it, a compromised server could substitute its own key. Find yours under **Preferences and security** (unlock first).
 
-Organization-wide 2FA enforcement for CloudVault login is coming soon.
+### Does CloudVault support two-factor login?
 
-## Getting Started
+Sign-in is through GitHub (use GitHub's own 2FA) or an emailed link (protect your email with 2FA). Separately, CloudVault can store 2FA secrets for your other accounts and show their current codes.
 
-### How do I create an account?
+### What happens when someone leaves?
 
-1. Go to your CloudVault instance
-2. Click "Sign in with GitHub" or enter your email for a magic link
-3. Complete the setup by creating your master password
-4. Create or join an organization
+An admin removes them on the **Members** page, and CloudVault offers to rotate the vault key right away. Rotation re-encrypts everything with a new key. Also change the passwords that person used, because they may remember or have saved them.
 
-### How do I add my first password?
+## Using CloudVault
 
-1. Make sure you're logged in and have selected an organization
-2. Click the "+ Add Password" button (or press Ctrl+N)
-3. Fill in the name, URL, username, and password
-4. Click "Add Password"
+### How do I add a password?
 
-### How do I import passwords from another password manager?
+Click **New item** (or press `n`), choose the type, and fill it in. Use **Generate** for a strong random password.
 
-1. Go to the "Import/Export" page
-2. Select your current password manager (Bitwarden, LastPass, or generic CSV)
-3. Export your passwords from your old password manager as CSV
-4. Upload the CSV file to CloudVault
-5. Review the preview and click "Import"
+### How do I import from another password manager?
 
-## Organizations
+Export a CSV from Bitwarden, LastPass or another manager, then use **Import / Export** in CloudVault. Delete the CSV afterwards; it is not encrypted.
 
-### What is an organization?
+### How do I back up the vault?
 
-An organization is a shared vault where multiple users can access the same passwords. Each organization has its own encryption key, and members can have different permission levels.
+**Import / Export > Encrypted backup** downloads a file protected by a passphrase you choose. It can be restored into any CloudVault organization.
 
-### What are the different roles?
+### Keyboard shortcuts
 
-- **Admin**: Full access, can manage users, settings, and view audit logs
-- **Member**: Can view and edit passwords
-- **Read Only**: Can only view passwords, cannot make changes
+When you're not typing in a field:
 
-### How do I invite someone to my organization?
+| Key | Action |
+|-----|--------|
+| `/` | Search |
+| `n` | New item |
+| `l` | Lock the vault |
 
-1. Go to "Users" (requires admin role)
-2. Click "Invite User"
-3. Enter their email address
-4. They'll receive an email to set up their account
-5. Once they've completed setup, return to approve their access
+### How do I share a password with someone outside the organization?
 
-### Why do I need to approve new members?
-
-When you approve a new member, CloudVault securely transfers the organization's encryption key to them. This two-step process ensures that only authorized users receive access to decrypt the passwords.
-
-## Features
-
-### How do I search for passwords?
-
-- Use the search box at the top of the password list
-- Press Ctrl+K (or Cmd+K on Mac) from anywhere to focus the search
-- Search by name, URL, or username
-
-### What are keyboard shortcuts?
-
-- **Ctrl+K** / **Cmd+K**: Focus search
-- **Ctrl+N** / **Cmd+N**: Create new password
-- **Ctrl+L** / **Cmd+L**: Lock vault
-
-### How do I share a password with someone outside my organization?
-
-1. Open the password you want to share
-2. Click the "Share" button
-3. Set an expiration time and maximum views
-4. Optionally add a password for extra security
-5. Copy the share link and send it to the recipient
-
-Share links are temporary and can be revoked at any time.
+Open the item and choose **Share**. Pick how long the link lasts and how many times it can be opened, and optionally add a password. Copy the link. The part after `#` is the decryption key, and CloudVault never sees it. Send the password, if you set one, through a different channel. You can revoke links from the item's **Sharing** tab.
 
 ### What is emergency access?
 
-Emergency access allows you to designate trusted contacts who can request access to your organization's passwords if you become unavailable. When they request access:
-1. A waiting period begins (default: 48 hours)
-2. You receive a notification and can deny the request
-3. If not denied, access is automatically granted after the waiting period
+Admins can name a trusted person (for example a board chair) as an emergency contact. If every admin becomes unreachable, that person opens **Emergency access** from their account menu and requests access. Admins are emailed and can deny it during the waiting period; afterwards the contact gets read-only access.
 
-## Troubleshooting
+### Why did the vault lock?
 
-### I can't log in
+The vault locks after the inactivity period in your preferences, when you press `l` or **Lock**, and whenever the page is reloaded (your keys only live in memory). The server separately signs you out after the same idle period.
 
-- Make sure you're using the correct email address
-- If using GitHub login, ensure your GitHub email matches your CloudVault account
-- Try clearing your browser cache and cookies
-- Check if magic link emails are going to your spam folder
+### Why did my copied password disappear?
 
-### The vault shows as "locked"
+CloudVault clears copied passwords from the clipboard after a delay (30 seconds by default). Change it under **Preferences and security**.
 
-This means your session has expired or you need to re-enter your master password. Click "Unlock" and enter your master password to continue.
+## Administration
 
-### I can't see any passwords
+### Can I limit who can sign up?
 
-- Make sure you've selected an organization from the dropdown
-- Ensure your master password is correct (vault is unlocked)
-- If you're new to the organization, your admin may need to approve your membership
+Yes. Set `ALLOW_SIGNUPS = "false"` in `wrangler.toml` and redeploy. Then only people an admin has invited can sign in.
 
-### Import failed
+### How long is the audit log kept?
 
-- Ensure your CSV file is in the correct format
-- Check that the file isn't too large (max 10MB)
-- Try exporting from your old password manager again
-- For generic CSV, ensure columns are named: name, url, username, password
+365 days by default. Admins can change it under **Settings > Policies** (30 days to 10 years). A daily job deletes older entries.
 
-### I'm getting "Too many requests" error
+### Can I self-host somewhere other than Cloudflare?
 
-CloudVault has rate limiting to prevent abuse. Wait a few minutes and try again. If this persists, contact your administrator.
-
-## Data & Privacy
-
-### Where is my data stored?
-
-CloudVault stores encrypted data on Cloudflare's global network. Your data is replicated across multiple regions for reliability, but it's always encrypted with your organization's unique key.
-
-### Can I export my data?
-
-Yes! Go to "Import/Export" and click "Download Export" to download all your passwords. The export file contains encrypted data that can be imported back into CloudVault.
-
-### How do I delete my account?
-
-Contact your organization admin to remove you from the organization. If you're the only admin, you can delete the entire organization from Settings.
-
-### What happens if CloudVault shuts down?
-
-Since CloudVault is open source and self-hosted, you control your own instance. You can export your data at any time. If you're using someone else's instance, make sure to regularly export backups.
-
-## Technical
-
-### What browsers are supported?
-
-CloudVault works in all modern browsers:
-- Chrome (recommended)
-- Firefox
-- Safari
-- Edge
-
-Note: Internet Explorer is not supported.
-
-### Is there a mobile app?
-
-CloudVault is a Progressive Web App (PWA) and works well on mobile browsers. You can add it to your home screen for an app-like experience. Native mobile apps are planned for the future.
-
-### Can I self-host CloudVault?
-
-Yes! CloudVault is designed for easy self-hosting on Cloudflare's free tier. See the deployment documentation for step-by-step instructions.
-
-### What's the maximum number of passwords I can store?
-
-There's no hard limit, but very large vaults (10,000+ passwords) may experience slower performance. For most teams, CloudVault handles thousands of passwords without issues.
-
----
-
-## Still have questions?
-
-- Check our [documentation](./README.md)
-- Review the [security documentation](./SECURITY.md)
-- Open an issue on GitHub in the project repository
+The API is built for Cloudflare Workers and D1. Porting it would mean replacing the D1 queries and the Worker entry point.

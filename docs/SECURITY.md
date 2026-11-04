@@ -1,262 +1,105 @@
-# CloudVault Security Documentation
+# Security model
 
-## Overview
+CloudVault is designed so that the server (and anyone who obtains its database) only holds ciphertext. This document describes the cryptography, what is and is not protected, and the operational advice that goes with it.
 
-CloudVault implements a **zero-knowledge architecture** where the server never has access to plaintext secrets. All encryption and decryption happens client-side in the browser using the Web Crypto API.
-
-## Cryptographic Design
-
-### Key Hierarchy
+## Key hierarchy
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Master Password                          │
-│                    (User's brain)                            │
-└─────────────────────┬───────────────────────────────────────┘
-                      │ PBKDF2 (100,000 iterations)
-                      ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Master Key (AES-256)                      │
-│              (Derived, never stored)                         │
-└─────────────────────┬───────────────────────────────────────┘
-                      │ Encrypts
-                      ▼
-┌─────────────────────────────────────────────────────────────┐
-│              User Private Key (RSA-OAEP)                     │
-│           (Stored encrypted on server)                       │
-└─────────────────────┬───────────────────────────────────────┘
-                      │ Decrypts
-                      ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Organization Key (AES-256-GCM)                  │
-│    (Encrypted with each user's public key, stored)          │
-└─────────────────────┬───────────────────────────────────────┘
-                      │ Encrypts
-                      ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Secret Data                               │
-│              (Stored as ciphertext)                          │
-└─────────────────────────────────────────────────────────────┘
+Master password (only in the user's head)
+  │ PBKDF2-SHA256, per-user salt, per-user iteration count (600,000 for new keys)
+  ▼
+Wrapping key (AES-256-GCM, derived in the browser, never stored)
+  │ encrypts
+  ▼
+User private key (RSA-OAEP SHA-256, 3072-bit for new users; stored encrypted)
+  │ decrypts
+  ▼
+Organization key (AES-256-GCM; one RSA-encrypted copy per member)
+  │ encrypts
+  ▼
+Items (AES-256-GCM, 96-bit random IV, associated data binds org and item id)
 ```
 
-### Algorithms Used
+| Purpose | Algorithm |
+|---------|-----------|
+| Master password stretching | PBKDF2-SHA256, 600,000 iterations (older accounts: 100,000 until the password is changed) |
+| User identity | RSA-OAEP with SHA-256, 3072-bit (older accounts: 2048-bit) |
+| Organization key and items | AES-256-GCM |
+| Item binding | AES-GCM associated data `cloudvault:secret:v2:<orgId>:<itemId>` |
+| Share links | AES-256-GCM with a random one-off key, associated data bound to the link id |
+| Share link password | PBKDF2-SHA256 (300,000 iterations) in the browser; server stores only SHA-256 of the derived token |
+| Encrypted backups | PBKDF2-SHA256 (600,000) + AES-256-GCM |
+| Randomness | `crypto.getRandomValues` |
 
-| Purpose | Algorithm | Key Size |
-|---------|-----------|----------|
-| Key Derivation | PBKDF2-SHA256 | 256-bit |
-| User Identity | RSA-OAEP | 4096-bit |
-| Secret Encryption | AES-256-GCM | 256-bit |
-| Random Generation | `crypto.getRandomValues()` | N/A |
+All cryptography uses the browser's Web Crypto API. There are no third-party crypto libraries.
 
-### Key Generation
+### Item formats
 
-**Master Key Derivation:**
-```javascript
-// PBKDF2 with 100,000 iterations
-const masterKey = await crypto.subtle.deriveKey(
-  {
-    name: 'PBKDF2',
-    salt: crypto.getRandomValues(new Uint8Array(16)),
-    iterations: 100000,
-    hash: 'SHA-256'
-  },
-  passwordKey,
-  { name: 'AES-GCM', length: 256 },
-  false,
-  ['encrypt', 'decrypt']
-);
-```
+`enc_version = 1` items (created before 0.3.0) were encrypted without associated data and remain readable. Every write since 0.3.0 uses format 2. Rotating the org key re-encrypts everything into format 2.
 
-**RSA Key Pair:**
-```javascript
-const keyPair = await crypto.subtle.generateKey(
-  {
-    name: 'RSA-OAEP',
-    modulusLength: 4096,
-    publicExponent: new Uint8Array([1, 0, 1]),
-    hash: 'SHA-256'
-  },
-  true,
-  ['encrypt', 'decrypt']
-);
-```
+## Flows
 
-**Organization Key:**
-```javascript
-const orgKey = await crypto.subtle.generateKey(
-  { name: 'AES-GCM', length: 256 },
-  true,
-  ['encrypt', 'decrypt']
-);
-```
+**Sign-up.** The user authenticates (GitHub or magic link), picks a master password, and the browser generates a key pair, wraps the private key, and uploads the public key, wrapped private key, salt and iteration count.
 
-## Data Flow
+**Unlock.** The browser downloads the wrapped private key and unwraps it with the master password. Keys exist only in memory. Locking, signing out, idle timeout or reloading the page discards them.
 
-### User Registration
+**Joining an organization.** An admin invites an email address. After the person signs in and sets up keys, the admin opens the approval dialog, which shows a fingerprint of the person's public key (first 16 bytes of SHA-256 of the SPKI, in eight groups of four hex digits). The person reads the fingerprint from their own Preferences page. That fingerprint is derived from their private key on their device, not from the server's copy. The admin approves only if the two match; the admin's browser then encrypts the org key for that public key.
 
-1. User authenticates via GitHub OAuth or Magic Link
-2. Browser generates RSA-4096 key pair
-3. Browser derives master key from chosen password (PBKDF2)
-4. Private key encrypted with master key, stored on server
-5. Public key stored unencrypted on server
-6. Salt stored on server (needed for key derivation)
+This check is what stops a malicious or compromised server from substituting its own public key and receiving the org key. If it is skipped, zero-knowledge holds only as long as the server is honest.
 
-### Creating an Organization
+**Removing a member.** Their copy of the org key is deleted, but they may have kept the key or anything they viewed. The UI offers an **org key rotation** immediately. The admin's browser generates a new org key, re-encrypts every item and every history entry, re-encrypts the new key for every remaining member and emergency contact, and commits all of it in one atomic request. If anything changed during rotation, the server rejects the commit and the browser retries. Passwords the removed person saw should still be changed at their source.
 
-1. Browser generates AES-256 organization key
-2. Org key encrypted with creator's public key
-3. Encrypted org key stored in membership record
+**Share links.** The sharer's browser decrypts the item, encrypts a copy under a fresh random key, and uploads only that copy. The link is `https://app/share/<id>#<key>`. Browsers never send the fragment to servers, and the share page removes it from the address bar after reading it. A link can expire, be limited to N views (counted atomically), require a password, and be revoked (which deletes its ciphertext). Every access is audited.
 
-### Adding a User
+**Emergency access.** An admin names an existing CloudVault user as an emergency contact after checking their fingerprint, and the admin's browser escrows the org key encrypted for that user's public key. If the contact requests access, all admins are emailed. After the waiting period (or an early approval), the contact can claim a read-only membership using the escrowed key. Admins can deny at any time before the claim. Escrowed keys are refreshed by key rotation; a stale key cannot be claimed.
 
-1. Admin invites user by email
-2. User creates account, generates key pair
-3. Admin's browser:
-   - Decrypts org key with their private key
-   - Re-encrypts org key with new user's public key
-4. New encrypted org key stored for the user
+## Server-side protections
 
-### Encrypting a Secret
+- **Sessions.** HS256 JWTs whose `jti` refers to a row in D1. That row enforces revocation (logout, sign out everywhere, master password change), absolute expiry (7 days) and the user's idle timeout.
+- **Login.** GitHub sign-in only trusts a verified primary email and matches on GitHub id first, so an unverified address can never take over an account. OAuth `state` is checked by the browser. Magic links are 256-bit random tokens, stored as SHA-256 hashes, valid once (atomic consume), 15 minutes by default, and delivered in the URL fragment.
+- **Invite-only mode.** Set `ALLOW_SIGNUPS=false` so only people an admin has invited can sign in.
+- **Authorization.** Every org route checks the caller's active membership and minimum role. An org always keeps at least one admin.
+- **Validation.** Every request body is validated with Zod: sizes, hex/base64 formats, http(s)-only URLs, enum roles.
+- **Rate limiting.** D1-backed, atomic fixed windows on login (20/min/IP), magic links (5/15 min/IP and 3/15 min/address) and public share access (30/5 min/IP). An in-memory limiter covers authenticated routes.
+- **Headers.** The API sends `Cache-Control: no-store`, `default-src 'none'` CSP, HSTS, `nosniff`, `frame-ancestors 'none'`. The frontend build emits a Pages `_headers` file with a strict CSP whose `connect-src` is limited to the app and API origins. CORS allows only `APP_URL` (and localhost during development).
+- **Audit log.** Sign-ins, item views (the list returns metadata only, so viewing an item requires an audited fetch), edits, deletes, exports, share link creation and access, membership changes, key rotation and emergency access. Retention is configurable per org and enforced daily. Exported CSVs neutralize spreadsheet formulas.
 
-1. Browser retrieves encrypted org key
-2. Browser decrypts org key using user's private key
-3. Secret data serialized to JSON
-4. Browser generates random 96-bit IV
-5. Secret encrypted with org key (AES-256-GCM)
-6. Ciphertext + IV sent to server
-
-### Decrypting a Secret
-
-1. Browser retrieves ciphertext + IV from server
-2. Browser decrypts org key (if not cached)
-3. Browser decrypts secret with org key
-4. Plaintext never leaves browser memory
-
-## Security Features
-
-### Transport Security
-
-- **HTTPS Only**: All traffic encrypted via TLS 1.3
-- **HSTS**: Strict-Transport-Security header enforced
-- **Certificate Pinning**: Cloudflare handles certificate management
-
-### HTTP Security Headers
-
-```
-X-Frame-Options: DENY
-X-Content-Type-Options: nosniff
-Referrer-Policy: strict-origin-when-cross-origin
-X-XSS-Protection: 1; mode=block
-Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
-Permissions-Policy: camera=(), microphone=(), geolocation=()
-Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
-```
-
-### Authentication
-
-- **JWT Tokens**: 7-day expiry, signed with HS256, includes unique JTI for revocation
-- **Token Blacklist**: Logout immediately invalidates tokens via Cloudflare KV blacklist
-- **Distributed Rate Limiting**: Global rate limiting via Cloudflare KV (not per-isolate)
-  - Auth endpoints: 10 requests/minute
-  - Magic link requests: 5 requests/15 minutes
-  - General API: 100 requests/minute
-- **Magic Link Expiry**: 15 minutes, single use
-
-### Session Security
-
-- **Server-Enforced Timeout**: Session timeout checked server-side on every request
-- **Configurable Duration**: Users can set timeout from 1-120 minutes (0 = never)
-- **Activity Tracking**: Last activity timestamp stored in Cloudflare KV
-- **Auto-Lock**: Vault locks after configurable inactivity (default 15 min)
-- **Visibility Lock**: Can lock when tab becomes hidden
-- **Manual Lock**: User can lock at any time
-
-### Clipboard Security
-
-- **Auto-Clear**: Clipboard cleared 30 seconds after copy (configurable)
-- **Verification**: Only clears if clipboard still contains copied password
-
-### Audit Trail
-
-Every sensitive action is logged:
-- Who performed the action
-- What was affected
-- When it happened
-- IP address and user agent
-
-Audit logs are immutable and cannot be deleted by users.
-
-## Threat Model
-
-### What We Protect Against
+## Threat model
 
 | Threat | Mitigation |
 |--------|------------|
-| Server breach | Zero-knowledge: server only has ciphertext |
-| Database leak | All secrets encrypted, keys not stored |
-| Man-in-the-middle | HTTPS + HSTS |
-| XSS | CSP headers, React's built-in escaping |
-| CSRF | SameSite cookies, custom headers |
-| Brute force | Distributed rate limiting, PBKDF2 key stretching |
-| Session hijacking | Token blacklist, server-enforced timeout |
-| Stolen token | JWT blacklist invalidates on logout |
-| Insider threat | Audit logging, role-based access |
+| Database or backup leak | Only ciphertext, wrapped keys, hashed tokens and metadata are stored |
+| Malicious server substituting a public key | Fingerprint verification before approving members and emergency contacts |
+| Server swapping ciphertext between items | AES-GCM associated data (format 2) |
+| Removed member keeps the org key | Key rotation |
+| Stolen session token | Idle timeout, revocation, sign out everywhere; it still cannot decrypt without the master password |
+| Account takeover through GitHub email | Verified primary email only, GitHub id matched first |
+| Brute force on login or share passwords | Rate limits; slow KDFs on the client |
+| XSS | React escaping, strict CSP, http(s)-only links, no `dangerouslySetInnerHTML` |
+| Clickjacking | `frame-ancestors 'none'`, `X-Frame-Options: DENY` |
+| Insider misuse | Roles, per-view audit log, CSV export |
 
-### What We Don't Protect Against
+### What CloudVault does not protect against
 
-| Threat | Reason |
-|--------|--------|
-| Compromised browser | If attacker controls browser, game over |
-| Keyloggers | Master password can be captured |
-| Screen capture | Decrypted passwords visible on screen |
-| Memory forensics | Keys exist in memory during session |
-| Weak master password | User responsibility |
+| Threat | Why |
+|--------|-----|
+| A compromised browser, extension or device | The attacker sees what you see, including the master password as you type it |
+| A malicious frontend served by a compromised host | Any web-delivered crypto app trusts the code it is served. Host the frontend on infrastructure you control, and protect your Cloudflare account with strong 2FA |
+| Weak master passwords | The setup screen requires 12+ characters and rejects weak choices, but cannot stop a guessable one |
+| Metadata | Item names, websites, usernames, categories, tags and expiry dates are visible to the server |
+| Forgotten master password | There is no recovery. An admin can re-invite the person after they create a new key. |
+| Someone a share link was sent to | Anyone with the full link (and password, if set) can open it until it expires or runs out of views |
 
-## Security Best Practices for Users
+## Operational advice
 
-1. **Use a strong master password** (16+ characters, random)
-2. **Don't reuse your master password** anywhere else
-3. **Enable auto-lock** for when you step away
-4. **Review audit logs** regularly for suspicious activity
-5. **Revoke access** for departing members immediately
-6. **Use unique passwords** for each secret (use the generator)
+1. Use a long, unique master password (four or more random words works well).
+2. Always do the fingerprint check before approving anyone.
+3. After removing someone, rotate the org key and change the passwords they used.
+4. Review the audit log regularly; export it for board records.
+5. Turn on `ALLOW_SIGNUPS=false` once your team is set up.
+6. Keep an encrypted backup (Import / Export) somewhere safe.
+7. Protect the Cloudflare and GitHub accounts that deploy CloudVault with hardware-key 2FA. Whoever controls them controls the code your browser runs.
 
-## Incident Response
+## Reporting a vulnerability
 
-### If You Suspect a Breach
-
-1. **Lock vault** immediately
-2. **Review audit logs** for unauthorized access
-3. **Change master password** if compromised
-4. **Rotate org key** (requires re-encrypting all secrets)
-5. **Remove suspicious users** from organization
-6. **Notify affected parties** if credentials were exposed
-
-### If Server is Compromised
-
-Even if an attacker obtains the database:
-- They only have encrypted blobs
-- Master passwords are not stored
-- Private keys are encrypted
-- Brute-forcing is computationally infeasible
-
-## Compliance Considerations
-
-CloudVault's zero-knowledge architecture supports compliance with:
-
-- **GDPR**: User data encrypted, audit trail available
-- **HIPAA**: Encryption at rest and in transit
-- **SOC 2**: Access controls, audit logging
-- **PCI-DSS**: Encryption of cardholder data (if storing cards)
-
-Note: Full compliance requires additional organizational controls beyond the software.
-
-## Security Contact
-
-To report security vulnerabilities, please open a private security advisory on GitHub or email the repository maintainer with:
-- Description of the vulnerability
-- Steps to reproduce
-- Potential impact
-- Suggested fix (if any)
-
-We aim to respond within 48 hours and will work with you on responsible disclosure.
+Please open a private security advisory on GitHub (Security tab, "Report a vulnerability") with steps to reproduce and the impact. We aim to respond within a few days.

@@ -1,582 +1,196 @@
-# CloudVault API Documentation
+# API reference
 
-Base URL: `/api`
+Base URL: `/api` on the Worker. Requests and responses are JSON. Authenticated routes need `Authorization: Bearer <token>`.
 
-All endpoints (except auth) require a Bearer token in the Authorization header:
+Errors look like:
+
+```json
+{ "error": "Human readable message", "code": "OPTIONAL_CODE" }
 ```
-Authorization: Bearer <jwt_token>
-```
 
-## Authentication
+| Status | Meaning |
+|--------|---------|
+| 400 | Validation failed (`"type": "validation"`) or a bad request |
+| 401 | Missing or invalid session. `code` is `SESSION_TIMEOUT` (idle) or `SESSION_ENDED` (revoked or expired) |
+| 403 | Not a member, or the role is too low |
+| 404 | Not found |
+| 409 | Conflict (duplicate, `VERSION_CONFLICT`, `ROTATION_CONFLICT`) |
+| 410 | Share link revoked, expired or used up |
+| 429 | Rate limited (`Retry-After` header) |
+| 503 | Server not configured |
 
-### GitHub OAuth
+Encodings: ciphertext is lowercase hex; IVs are 12 bytes as 24 hex characters; keys, salts and RSA-encrypted org keys are base64.
 
-#### GET `/auth/github`
-Redirects to GitHub OAuth authorization page.
+## Health
 
-#### POST `/auth/github/callback`
-Exchange GitHub authorization code for JWT token.
+`GET /api/health` returns `{ "status": "ok", "timestamp": "..." }`.
 
-**Request Body:**
+## Auth (`/api/auth`)
+
+Rate limited to 20 requests per minute per IP.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/config` | no | `{ github, magicLink, signupsAllowed }`: which sign-in methods exist |
+| GET | `/github?state=...` | no | Redirects to GitHub. `state` is 16 to 128 URL-safe characters, generated and checked by the client |
+| POST | `/github/callback` | no | `{ code }` returns a login response |
+| POST | `/magic-link` | no | `{ email }`. Always answers with a generic message. Limited to 5 per 15 minutes per IP and 3 per address |
+| POST | `/magic-link/verify` | no | `{ token }` (from the link's `#token=`) returns a login response. Single use |
+| GET | `/me` | yes | Current user |
+| PATCH | `/me` | yes | `{ name }` |
+| POST | `/setup-keys` | yes | `{ publicKey, encryptedPrivateKey, salt, kdfIterations }`. Once only (409 afterwards) |
+| PUT | `/keys` | yes | Change master password: `{ encryptedPrivateKey, salt, kdfIterations }`. Signs out other sessions |
+| POST | `/logout` | yes | Revokes this session |
+| POST | `/logout-all` | yes | Revokes every session: `{ sessionsRevoked }` |
+| GET | `/session` | yes | `{ expiresAt, now }` (unix seconds) |
+
+Login response:
+
 ```json
 {
-  "code": "github_authorization_code"
-}
-```
-
-**Response:**
-```json
-{
-  "token": "jwt_token",
+  "token": "eyJ...",
+  "expiresAt": 1767225600,
   "user": {
-    "id": "uuid",
-    "email": "user@example.com",
-    "name": "User Name",
-    "publicKey": "base64_encoded_key",
-    "encryptedPrivateKey": "base64_encoded_encrypted_key",
-    "salt": "base64_encoded_salt",
-    "authProvider": "github",
-    "createdAt": "2024-01-01T00:00:00Z"
+    "id": "uuid", "email": "a@example.org", "name": "A",
+    "publicKey": "base64|null", "encryptedPrivateKey": "base64|null", "salt": "base64|null",
+    "kdfIterations": 600000, "authProvider": "github|magic_link", "createdAt": "..."
   },
-  "isNewUser": false
+  "needsKeySetup": false
 }
 ```
 
-### Magic Link
+## Organizations (`/api/organizations`)
 
-#### POST `/auth/magic-link`
-Request a magic link email.
+All routes require a session. "Role" is the minimum role needed.
 
-**Request Body:**
-```json
-{
-  "email": "user@example.com"
-}
-```
-
-**Response:**
-```json
-{
-  "message": "Magic link sent to user@example.com"
-}
-```
-
-#### POST `/auth/magic-link/verify`
-Verify magic link token and get JWT.
-
-**Request Body:**
-```json
-{
-  "token": "uuid_token"
-}
-```
-
-**Response:** Same as GitHub callback.
-
-### User Management
-
-#### GET `/auth/me`
-Get current authenticated user.
-
-**Response:**
-```json
-{
-  "id": "uuid",
-  "email": "user@example.com",
-  "name": "User Name",
-  "publicKey": "base64_encoded_key",
-  "encryptedPrivateKey": "base64_encoded_encrypted_key",
-  "salt": "base64_encoded_salt",
-  "authProvider": "github",
-  "createdAt": "2024-01-01T00:00:00Z"
-}
-```
-
-#### POST `/auth/setup-keys`
-Set up encryption keys for new user.
-
-**Request Body:**
-```json
-{
-  "publicKey": "base64_encoded_public_key",
-  "encryptedPrivateKey": "base64_encoded_encrypted_private_key",
-  "salt": "base64_encoded_salt"
-}
-```
-
----
-
-## Organizations
-
-#### GET `/organizations`
-List user's organizations.
-
-**Response:**
-```json
-[
-  {
-    "id": "uuid",
-    "name": "My Org",
-    "role": "admin",
-    "encryptedOrgKey": "base64_encoded_key",
-    "createdAt": "2024-01-01T00:00:00Z"
-  }
-]
-```
-
-#### POST `/organizations`
-Create a new organization.
-
-**Request Body:**
-```json
-{
-  "name": "Organization Name",
-  "encryptedOrgKey": "base64_encoded_key"
-}
-```
+| Method | Path | Role | Description |
+|--------|------|------|-------------|
+| GET | `/` | any user | `{ organizations: [{ id, name, role, encryptedOrgKey, keyVersion, createdAt }], pendingInvites: [{ id, name }] }` |
+| POST | `/` | any user with keys | `{ name, encryptedOrgKey }` creates an org with you as admin |
+| GET | `/:orgId` | read_only | Org details and your role |
+| PATCH | `/:orgId` | admin | `{ name }` |
+| DELETE | `/:orgId` | admin | Deletes the org and all its data atomically. Audit rows are kept |
+| POST | `/:orgId/leave` | read_only | Leave. The last admin cannot leave |
 
 ### Members
 
-#### GET `/organizations/:orgId/members`
-List organization members. Requires admin role.
+| Method | Path | Role | Description |
+|--------|------|------|-------------|
+| GET | `/:orgId/members` | read_only | Admins see pending invites too. Each: `{ userId, role, status, userEmail, userName, userPublicKey, hasKeys, createdAt }` |
+| POST | `/:orgId/members` | admin | `{ email, role? }` creates a pending membership (and a placeholder user if needed). Emails an invite when Resend is configured |
+| POST | `/:orgId/members/:userId/approve` | admin | `{ encryptedOrgKey }`: the org key encrypted for the member's public key. 409 if they have no keys yet |
+| PATCH | `/:orgId/members/:userId` | admin | `{ role }`. You cannot change your own role; the last admin cannot be demoted |
+| DELETE | `/:orgId/members/:userId` | admin | Remove a member or cancel an invite. Returns `{ recommendKeyRotation }` |
 
-**Response:**
-```json
-[
-  {
-    "userId": "uuid",
-    "orgId": "uuid",
-    "role": "admin",
-    "encryptedOrgKey": "base64_encoded_key",
-    "status": "active",
-    "userEmail": "user@example.com",
-    "userName": "User Name",
-    "userPublicKey": "base64_encoded_key",
-    "createdAt": "2024-01-01T00:00:00Z"
-  }
-]
-```
+### Key rotation
 
-#### POST `/organizations/:orgId/members`
-Invite a user. Requires admin role.
-
-**Request Body:**
-```json
-{
-  "email": "newuser@example.com"
-}
-```
-
-#### POST `/organizations/:orgId/members/:userId/approve`
-Approve pending user. Requires admin role.
-
-**Request Body:**
-```json
-{
-  "encryptedOrgKey": "base64_org_key_encrypted_for_user"
-}
-```
-
-#### PATCH `/organizations/:orgId/members/:userId`
-Update user role. Requires admin role.
-
-**Request Body:**
-```json
-{
-  "role": "member"  // "admin" | "member" | "read_only"
-}
-```
-
-#### DELETE `/organizations/:orgId/members/:userId`
-Remove user from organization. Requires admin role.
-
----
+| Method | Path | Role | Description |
+|--------|------|------|-------------|
+| GET | `/:orgId/key-rotation` | admin | `{ keyVersion, secrets[], history[], members[{ userId, email, publicKey }], emergencyContacts[{ contactId, email, publicKey }] }` |
+| POST | `/:orgId/key-rotation` | admin | `{ fromKeyVersion, secrets[{ id, ciphertextBlob, iv, encVersion }], history[{ id, ... }], memberKeys[{ userId, encryptedOrgKey }], emergencyKeys[{ contactId, encryptedOrgKey }] }`. Must cover exactly the current secrets, history, active members and contacts, else 409 `ROTATION_CONFLICT`. Applied atomically; returns `{ keyVersion }` |
 
 ## Secrets
 
-#### GET `/organizations/:orgId/secrets`
-List secrets with optional filtering.
+| Method | Path | Role | Description |
+|--------|------|------|-------------|
+| GET | `/:orgId/secrets` | read_only | Metadata only (no ciphertext). Filters: `?categoryId=`, `?type=`, `?favorites=true` |
+| GET | `/:orgId/secrets/:id` | read_only | Full item with ciphertext. Audited as `VIEW_SECRET` |
+| POST | `/:orgId/secrets` | member | Create (see body below). 201 |
+| PUT | `/:orgId/secrets/:id` | member | Partial update. Send `expectedVersion` to get 409 `VERSION_CONFLICT` instead of overwriting someone else's change |
+| DELETE | `/:orgId/secrets/:id` | member | Deletes the item, its history, favorites and share links |
+| PATCH | `/:orgId/secrets/:id/favorite` | read_only | `{ isFavorite }` (per user) |
+| GET | `/:orgId/secrets/:id/history` | read_only | Previous versions (newest 20), with `changedByEmail`. Audited |
+| GET | `/:orgId/secrets/expiring` | read_only | Items expiring within 30 days or already expired |
+| GET | `/:orgId/secrets/export` | read_only | `{ version, exportedAt, orgId, secrets: [full items] }`. Audited |
+| POST | `/:orgId/secrets/import` | member | `{ secrets: [create bodies, 1 to 500], categoryId? }` in one statement. 201 `{ imported, ids }` |
 
-**Query Parameters:**
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| categoryId | uuid | Filter by category |
-| type | string | Filter by type (password, note, api_key, card) |
-| favorites | boolean | Only show favorites |
-| search | string | Search in name, URL, tags |
+Create body:
 
-**Response:**
-```json
-[
-  {
-    "id": "uuid",
-    "orgId": "uuid",
-    "name": "Gmail",
-    "url": "https://gmail.com",
-    "usernameHint": "user@...",
-    "ciphertextBlob": "base64_encrypted_data",
-    "iv": "base64_iv",
-    "version": 1,
-    "createdBy": "uuid",
-    "updatedAt": "2024-01-01T00:00:00Z",
-    "categoryId": "uuid",
-    "isFavorite": true,
-    "secretType": "password",
-    "expiresAt": "2025-01-01T00:00:00Z",
-    "tags": ["email", "work"],
-    "categoryName": "Email",
-    "categoryColor": "#6366f1"
-  }
-]
-```
-
-#### GET `/organizations/:orgId/secrets/:secretId`
-Get a single secret. Logs VIEW_SECRET audit event.
-
-#### POST `/organizations/:orgId/secrets`
-Create a new secret. Requires member role or higher.
-
-**Request Body:**
 ```json
 {
-  "name": "Secret Name",
-  "url": "https://example.com",
-  "usernameHint": "user@...",
-  "ciphertextBlob": "base64_encrypted_data",
-  "iv": "base64_iv",
-  "categoryId": "uuid",
-  "secretType": "password",
-  "tags": ["tag1", "tag2"],
-  "expiresAt": "2025-01-01T00:00:00Z"
+  "id": "client-generated uuid (required when encVersion is 2)",
+  "name": "Bank",
+  "url": "https://bank.example (http/https only)",
+  "usernameHint": "treasurer@example.org",
+  "ciphertextBlob": "hex",
+  "iv": "24 hex chars",
+  "encVersion": 2,
+  "categoryId": "uuid|null",
+  "secretType": "password|note|api_key|card|totp",
+  "tags": ["finance"],
+  "expiresAt": "2027-01-01T00:00:00Z|null"
 }
 ```
 
-#### PUT `/organizations/:orgId/secrets/:secretId`
-Update a secret. Creates history entry if ciphertext changes.
-
-**Request Body:** Same as create, all fields optional.
-
-#### PATCH `/organizations/:orgId/secrets/:secretId/favorite`
-Toggle favorite status.
-
-**Request Body:**
-```json
-{
-  "isFavorite": true
-}
-```
-
-#### DELETE `/organizations/:orgId/secrets/:secretId`
-Delete a secret. Requires member role or higher.
-
-#### GET `/organizations/:orgId/secrets/:secretId/history`
-Get password history for a secret.
-
-**Response:**
-```json
-[
-  {
-    "id": 1,
-    "secretId": "uuid",
-    "version": 1,
-    "ciphertextBlob": "base64_encrypted_data",
-    "iv": "base64_iv",
-    "changedBy": "uuid",
-    "changedByEmail": "user@example.com",
-    "createdAt": "2024-01-01T00:00:00Z"
-  }
-]
-```
-
-#### GET `/organizations/:orgId/secrets/expiring`
-Get secrets expiring within 30 days.
-
----
+When the ciphertext changes, the version is incremented and the previous ciphertext moves to history.
 
 ## Categories
 
-#### GET `/organizations/:orgId/categories`
-List categories with secret counts.
+| Method | Path | Role | Description |
+|--------|------|------|-------------|
+| GET | `/:orgId/categories` | read_only | With `secretCount` |
+| POST | `/:orgId/categories` | member | `{ name, icon?, color? }` (icon `[a-z0-9-]`, color `#rrggbb`) |
+| PUT | `/:orgId/categories/:id` | member | `{ name?, icon?, color?, sortOrder? }` |
+| DELETE | `/:orgId/categories/:id` | admin | Items in it become uncategorized |
 
-**Response:**
-```json
-[
-  {
-    "id": "uuid",
-    "orgId": "uuid",
-    "name": "Email",
-    "icon": "mail",
-    "color": "#6366f1",
-    "sortOrder": 0,
-    "secretCount": 5,
-    "createdAt": "2024-01-01T00:00:00Z"
-  }
-]
-```
+## Share links
 
-#### POST `/organizations/:orgId/categories`
-Create a category. Requires member role or higher.
+| Method | Path | Role | Description |
+|--------|------|------|-------------|
+| POST | `/:orgId/secrets/:id/shares` | member | `{ id, ciphertextBlob, iv, expiresInHours, maxViews, allowCopy, recipientEmail?, accessSalt?, accessVerifier? }`. The client encrypts a copy of the item with a one-off key that stays in the URL fragment. `accessVerifier` is SHA-256 (hex) of the client-derived password token |
+| GET | `/:orgId/secrets/:id/shares` | read_only | Links for an item, with status and view counts |
+| DELETE | `/:orgId/shares/:linkId` | member | Revoke and delete its ciphertext |
 
-**Request Body:**
-```json
-{
-  "name": "Category Name",
-  "icon": "folder",
-  "color": "#6366f1"
-}
-```
+Public (no auth, 30 requests per 5 minutes per IP):
 
-#### PUT `/organizations/:orgId/categories/:categoryId`
-Update a category.
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/share/:linkId` | `{ secretName, orgName, requiresPassword, accessSalt, allowCopy, expiresAt, remainingViews }`. Does not use a view |
+| POST | `/api/share/:linkId/access` | `{ accessToken? }`. Uses one view (atomically) and returns `{ name, url, secretType, ciphertextBlob, iv, allowCopy, remainingViews }`. 401 `PASSWORD_REQUIRED` / `PASSWORD_INCORRECT`; 410 when no longer available |
 
-#### DELETE `/organizations/:orgId/categories/:categoryId`
-Delete a category. Requires admin role. Secrets are moved to uncategorized.
+## Settings and health
 
----
+| Method | Path | Role | Description |
+|--------|------|------|-------------|
+| GET | `/:orgId/settings` | read_only | `{ minPasswordLength, passwordExpiryDays, allowShareLinks, shareLinkMaxHours, allowEmergencyAccess, emergencyWaitMinHours, auditRetentionDays }` |
+| PUT | `/:orgId/settings` | admin | Any subset of the above |
+| GET | `/:orgId/health` | read_only | `{ healthScore, totalSecrets, metrics: { expiringSoon, expired, oldPasswords }, expiringSecrets[], oldPasswords[] }` |
 
-## User Preferences
+## Audit log (admins)
 
-#### GET `/preferences`
-Get current user's preferences.
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/:orgId/audit` | `?limit=1..100&offset=&action=&userId=&startDate=&endDate=` returns `{ logs[], total }` |
+| GET | `/:orgId/audit/export` | CSV download (formula-safe) |
+| GET | `/:orgId/audit/stats` | `{ actionCounts, topUsers, last7Days }` |
 
-**Response:**
-```json
-{
-  "theme": "system",
-  "sessionTimeout": 15,
-  "clipboardClear": 30,
-  "showFavicons": true,
-  "compactView": false
-}
-```
+Actions: `LOGIN`, `LOGOUT`, `LOGOUT_ALL`, `SETUP_KEYS`, `CHANGE_MASTER_PASSWORD`, `UPDATE_PROFILE`, `VIEW_SECRET`, `CREATE_SECRET`, `UPDATE_SECRET`, `DELETE_SECRET`, `VIEW_SECRET_HISTORY`, `IMPORT_SECRETS`, `EXPORT_SECRETS`, `CREATE_ORG`, `UPDATE_ORG`, `DELETE_ORG`, `UPDATE_ORG_SETTINGS`, `ROTATE_ORG_KEY`, `INVITE_USER`, `APPROVE_USER`, `REMOVE_USER`, `LEAVE_ORG`, `UPDATE_USER_ROLE`, `CREATE_CATEGORY`, `UPDATE_CATEGORY`, `DELETE_CATEGORY`, `CREATE_SHARE_LINK`, `REVOKE_SHARE_LINK`, `ACCESS_SHARE_LINK`, `ADD_EMERGENCY_CONTACT`, `REMOVE_EMERGENCY_CONTACT`, `EMERGENCY_ACCESS_REQUESTED`, `EMERGENCY_ACCESS_APPROVED`, `EMERGENCY_ACCESS_DENIED`, `EMERGENCY_ACCESS_GRANTED`, `VIEW_AUDIT_LOG`, `EXPORT_AUDIT_LOG`.
 
-#### PUT `/preferences`
-Update preferences.
+## Emergency access
 
-**Request Body:** Any subset of preference fields.
+Admin routes under `/api/organizations`:
 
----
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/:orgId/emergency-contacts` | Active contacts |
+| GET | `/:orgId/emergency-contacts/lookup?email=` | `{ userId, email, name, publicKey }` for an existing user with keys |
+| POST | `/:orgId/emergency-contacts` | `{ contactEmail, contactName?, waitTimeHours, encryptedOrgKey }` (org key encrypted for the contact's public key) |
+| DELETE | `/:orgId/emergency-contacts/:id` | Revoke; open requests are denied |
+| GET | `/:orgId/emergency-requests` | Requests with status and `canRespond` |
+| POST | `/:orgId/emergency-requests/:id/approve` | Grant now (from `pending`) |
+| POST | `/:orgId/emergency-requests/:id/deny` | Deny (from `pending` or `approved`) |
 
-## Audit Logs
+Contact routes under `/api/emergency` (authenticated as the contact):
 
-#### GET `/organizations/:orgId/audit`
-Get audit logs. Requires admin role.
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/access` | Orgs where you are a contact, with the latest request |
+| POST | `/access/:contactId/request` | `{ reason }` (10 to 500 characters). Emails the org's admins |
+| POST | `/access/requests/:id/claim` | After the wait (or approval): creates a read-only membership with the escrowed key. 403 `WAITING_PERIOD` if too early |
 
-**Query Parameters:**
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| limit | number | Max results (default 50, max 100) |
-| offset | number | Pagination offset |
-| action | string | Filter by action type |
-| userId | uuid | Filter by user |
-| startDate | datetime | Filter from date |
-| endDate | datetime | Filter to date |
+## Preferences (`/api/preferences`)
 
-**Response:**
-```json
-{
-  "logs": [
-    {
-      "id": 1,
-      "orgId": "uuid",
-      "userId": "uuid",
-      "userEmail": "user@example.com",
-      "action": "VIEW_SECRET",
-      "targetType": "secret",
-      "targetId": "uuid",
-      "targetName": "Gmail",
-      "metadata": "{\"key\": \"value\"}",
-      "ipAddress": "1.2.3.4",
-      "timestamp": "2024-01-01T00:00:00Z"
-    }
-  ],
-  "total": 100
-}
-```
-
-**Action Types:**
-- `CREATE_SECRET`, `VIEW_SECRET`, `UPDATE_SECRET`, `DELETE_SECRET`
-- `VIEW_SECRET_HISTORY`
-- `CREATE_CATEGORY`, `UPDATE_CATEGORY`, `DELETE_CATEGORY`
-- `INVITE_USER`, `APPROVE_USER`, `REMOVE_USER`, `UPDATE_USER_ROLE`
-- `CREATE_ORG`
-- `CREATE_SHARE_LINK`, `REVOKE_SHARE_LINK`, `ACCESS_SHARE_LINK`
-- `ADD_EMERGENCY_CONTACT`, `REMOVE_EMERGENCY_CONTACT`
-- `EMERGENCY_ACCESS_REQUESTED`, `EMERGENCY_ACCESS_DENIED`
-- `UPDATE_ORG_SETTINGS`
-
-#### GET `/organizations/:orgId/audit/export`
-Export audit logs as CSV.
-
----
-
-## Secure Sharing
-
-#### POST `/organizations/:orgId/secrets/:secretId/share`
-Create a temporary share link for a secret.
-
-**Request Body:**
-```json
-{
-  "expiresInHours": 24,
-  "maxViews": 1,
-  "accessPassword": "optional-password",
-  "allowCopy": true,
-  "recipientEmail": "recipient@example.com"
-}
-```
-
-**Response:**
-```json
-{
-  "id": "uuid",
-  "url": "https://app.example.com/share/uuid",
-  "expiresAt": "2024-01-02T00:00:00Z",
-  "maxViews": 1,
-  "hasPassword": true,
-  "allowCopy": true,
-  "recipientEmail": "recipient@example.com"
-}
-```
-
-#### GET `/organizations/:orgId/secrets/:secretId/shares`
-List all share links for a secret.
-
-#### DELETE `/organizations/:orgId/shares/:linkId`
-Revoke a share link.
-
-#### GET `/share/public/:linkId` (No Auth Required)
-Get share link info before accessing.
-
-#### POST `/share/public/:linkId/access` (No Auth Required)
-Access shared secret with optional password.
-
----
-
-## Emergency Access
-
-#### GET `/organizations/:orgId/emergency-contacts`
-List emergency contacts. Requires admin role.
-
-#### POST `/organizations/:orgId/emergency-contacts`
-Add an emergency contact.
-
-**Request Body:**
-```json
-{
-  "contactEmail": "trusted@example.com",
-  "contactName": "Trusted Contact",
-  "waitTimeHours": 48
-}
-```
-
-#### DELETE `/organizations/:orgId/emergency-contacts/:contactId`
-Remove an emergency contact.
-
-#### GET `/organizations/:orgId/emergency-requests`
-List emergency access requests. Requires admin role.
-
-#### POST `/emergency/request/:contactId` (No Auth Required)
-Request emergency access.
-
-**Request Body:**
-```json
-{
-  "reason": "Need access because admin is unavailable..."
-}
-```
-
-#### POST `/organizations/:orgId/emergency-requests/:requestId/deny`
-Deny an emergency access request.
-
----
-
-## Organization Settings
-
-#### GET `/organizations/:orgId/settings`
-Get organization settings.
-
-**Response:**
-```json
-{
-  "require2fa": false,
-  "minPasswordLength": 12,
-  "passwordExpiryDays": 90,
-  "allowShareLinks": true,
-  "shareLinkMaxHours": 168,
-  "allowEmergencyAccess": true,
-  "emergencyWaitMinHours": 24,
-  "auditRetentionDays": 365
-}
-```
-
-#### PUT `/organizations/:orgId/settings`
-Update organization settings. Requires admin role.
-
-#### GET `/organizations/:orgId/health`
-Get password health report.
-
-**Response:**
-```json
-{
-  "healthScore": 85,
-  "totalSecrets": 50,
-  "metrics": {
-    "expiringSoon": 3,
-    "expired": 1,
-    "oldPasswords": 5
-  },
-  "expiringSecrets": [...],
-  "oldPasswords": [...]
-}
-```
-
----
-
-## Error Responses
-
-All errors follow this format:
-
-```json
-{
-  "error": "Error message",
-  "type": "validation",  // Optional, present for validation errors
-  "code": "ERROR_CODE"   // Optional, present for specific error types
-}
-```
-
-**HTTP Status Codes:**
-| Code | Description |
-|------|-------------|
-| 400 | Bad Request / Validation Error |
-| 401 | Unauthorized (missing/invalid/revoked token or session timeout) |
-| 403 | Forbidden (insufficient permissions) |
-| 404 | Not Found |
-| 429 | Too Many Requests (rate limited) |
-| 500 | Internal Server Error |
-
-**Special Error Codes:**
-| Code | Description |
-|------|-------------|
-| `SESSION_TIMEOUT` | User's session has timed out due to inactivity. Client should prompt for re-authentication. |
-
----
-
-## Rate Limits
-
-Rate limiting is distributed globally via Cloudflare KV, ensuring limits are enforced across all edge locations.
-
-| Endpoint | Limit |
-|----------|-------|
-| Auth endpoints | 10 requests / minute |
-| Magic link | 5 requests / 15 minutes |
-| All other endpoints | 100 requests / minute |
-
-Rate limit headers are included in responses:
-```
-X-RateLimit-Limit: 100
-X-RateLimit-Remaining: 99
-X-RateLimit-Reset: 60
-```
-
-When rate limited, the response includes a `Retry-After` header.
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/` | `{ theme, sessionTimeout, clipboardClear, showFavicons, compactView }` |
+| PUT | `/` | Any subset. `sessionTimeout` (minutes, 0 = never, max 1440) also applies to live sessions |
