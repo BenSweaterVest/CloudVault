@@ -1,282 +1,176 @@
 # CloudVault
 
+[![CI](https://github.com/BenSweaterVest/CloudVault/actions/workflows/ci.yml/badge.svg)](https://github.com/BenSweaterVest/CloudVault/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Built with Cloudflare Workers](https://img.shields.io/badge/Built%20with-Cloudflare%20Workers-orange)](https://workers.cloudflare.com/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.0-blue)](https://www.typescriptlang.org/)
-[![React](https://img.shields.io/badge/React-18-61dafb)](https://react.dev/)
 
-A zero-knowledge serverless password vault for small organizations, built on Cloudflare's free tier.
+A shared password vault for small organizations (nonprofits, boards, clubs, small teams) that runs entirely on Cloudflare's **free plan**. Passwords are encrypted and decrypted in each person's browser; the server only ever stores ciphertext.
 
-## Table of Contents
+## Contents
 
-- [Features](#features)
-- [Tech Stack](#tech-stack)
-- [Project Structure](#project-structure)
-- [Getting Started](#getting-started)
-- [Deployment](#deployment)
-- [Security Architecture](#security-architecture)
-- [Contributing](#contributing)
+- [What it does](#what-it-does)
+- [How the encryption works](#how-the-encryption-works)
+- [What the server can see](#what-the-server-can-see)
+- [Tech stack](#tech-stack)
+- [Getting started (local)](#getting-started-local)
+- [Deploying](#deploying)
+- [Free plan budget](#free-plan-budget)
+- [Project layout](#project-layout)
 - [Documentation](#documentation)
-- [License](#license)
 
-## Features
+## What it does
 
-### Core Security
-- **Zero-Knowledge Architecture**: All encryption/decryption happens in the browser. The server never sees plaintext passwords.
-- **Audit Logging**: Track who viewed, created, or modified credentials - perfect for nonprofit governance.
-- **Password History**: View previous versions of credentials with full change tracking.
-- **Role-Based Access**: Admin, Member, and Read-Only roles for different access levels.
-- **Session Timeout**: Server-enforced auto-lock after configurable period of inactivity.
-- **Clipboard Auto-Clear**: Passwords cleared from clipboard after 30 seconds.
-- **JWT Token Blacklist**: Logout immediately invalidates tokens server-side.
+**Vault**
+- Logins (with built-in 2FA code generator), secure notes, API keys and payment cards, plus encrypted custom fields
+- Categories, tags, per-person favorites, search and filters
+- Version history: the last 20 versions of each item, decrypted locally, with one-click restore
+- Expiry dates with reminders on the Health page, plus an in-browser weak and reused password check
+- Password generator (unbiased, configurable, respects the organization's minimum length)
 
-### Authentication
-- **Dual Authentication**: GitHub OAuth for developers, Magic Links for non-technical board members.
-- **Distributed Rate Limiting**: Global rate limiting via Cloudflare KV protects against brute-force attacks.
+**Teams**
+- Multiple organizations per person; roles: admin, member, read-only
+- Invitations by email; admins approve new members after comparing **key fingerprints**, so a compromised server cannot slip in its own key
+- **Org key rotation** in the browser, offered automatically after removing someone
+- **Audit log** of sign-ins, every view, edit, export, share and admin action, with CSV export for board reporting and configurable retention
 
-### Organization
-- **Multiple Secret Types**: Passwords, secure notes, API keys, and payment cards.
-- **Categories**: Organize secrets with custom categories, icons, and colors.
-- **Tags & Search**: Full-text search across names, URLs, and tags.
-- **Favorites**: Quick access to frequently used credentials.
-- **Expiration Tracking**: Set and monitor password expiration dates.
+**Sharing and continuity**
+- **Share links** for people outside the vault: expiring, view-limited, optionally password protected. The decryption key lives only in the link's `#fragment`, never on the server
+- **Emergency access**: admins name a trusted person; if every admin becomes unreachable, that person can request read-only access, which is granted after a waiting period unless an admin denies it
+- **Import** from Bitwarden, LastPass or any CSV; **export** as a passphrase-encrypted backup or a Bitwarden-format CSV
 
-### User Experience
-- **Dark Mode**: Full dark theme with system preference detection.
-- **Keyboard Shortcuts**: Cmd/Ctrl+K for search, Cmd+N for new, etc.
-- **Password Generator**: Configurable secure password generation.
-- **Import/Export**: Import from Bitwarden, LastPass, or generic CSV; export encrypted backups.
-- **Skeleton Loaders**: Smooth loading states instead of spinners.
-- **Toast Notifications**: Feedback for all user actions.
+**Sign-in and session security**
+- GitHub OAuth or emailed magic links (via Resend's free tier); optional invite-only mode
+- Vault auto-locks after inactivity; the server also ends idle sessions; "sign out everywhere"
+- Copied passwords are cleared from the clipboard after a delay you choose
+- Master password change (keys are re-encrypted locally; organization access is unaffected)
 
-### Accessibility
-- **WCAG 2.1 AA Compliant**: Skip links, ARIA labels, focus management.
-- **Screen Reader Support**: Live region announcements for dynamic content.
-- **Keyboard Navigation**: Full keyboard accessibility throughout.
-
-## Tech Stack
-
-- **Frontend**: React 18 + Vite 5 + Tailwind CSS (deployed to Cloudflare Pages)
-- **Backend**: Cloudflare Workers with Hono framework
-- **Database**: Cloudflare D1 (SQLite)
-- **Cache/State**: Cloudflare KV (rate limiting, token blacklist, session tracking)
-- **Auth**: GitHub OAuth + Magic Links (via Resend)
-- **Crypto**: Web Crypto API (native browser, zero dependencies)
-- **Validation**: Zod schemas for all API endpoints
-- **Testing**: Vitest + Testing Library
-- **CI/CD**: GitHub Actions with auto-deploy
-
-## Project Structure
+## How the encryption works
 
 ```
-cloudvault/
-├── .github/
-│   └── workflows/
-│       └── ci.yml           # CI/CD pipeline
-├── docs/                    # Documentation
-│   ├── API.md               # API reference
-│   ├── ARCHITECTURE.md      # System design
-│   ├── DEPLOYMENT.md        # Deployment guide
-│   ├── SECURITY.md          # Security documentation
-│   └── TESTING.md           # Testing guide
-├── frontend/                # React app (Cloudflare Pages)
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── admin/       # AuditLog, UserManagement, HealthDashboard, OrgSettings
-│   │   │   ├── auth/        # Login, OAuth callbacks
-│   │   │   ├── ui/          # Toast, Theme, Skeleton, Accessibility
-│   │   │   └── vault/       # SecretList, PasswordGenerator, ImportExport, ShareModal, TOTP
-│   │   ├── hooks/           # useClipboard, useSessionTimeout, useKeyboardShortcuts
-│   │   ├── lib/             # Crypto, API, Auth utilities
-│   │   └── __tests__/       # Unit & integration tests
-│   │       ├── setup.ts     # Test environment config
-│   │       ├── crypto.test.ts
-│   │       ├── hooks.test.ts
-│   │       ├── components.test.tsx
-│   │       ├── api.test.ts
-│   │       ├── totp.test.ts
-│   │       └── integration.test.ts
-│   └── package.json
-├── worker/                  # API (Cloudflare Workers)
-│   ├── src/
-│   │   ├── routes/          # auth, secrets, categories, preferences, audit, sharing, emergency, settings
-│   │   ├── middleware/      # auth, audit, security, rateLimit
-│   │   ├── lib/             # validation (Zod schemas)
-│   │   ├── db/              # schema.sql
-│   │   └── __tests__/       # API validation tests
-│   │       └── validation.test.ts
-│   └── wrangler.toml
-├── CONTRIBUTING.md          # Contribution guidelines
-├── CHANGELOG.md             # Version history
-└── README.md
+master password --PBKDF2-SHA256 (600k)--> wrapping key
+wrapping key    --AES-256-GCM-->          your RSA-OAEP private key (stored encrypted)
+your public key --RSA-OAEP-->             the organization key (one copy per member)
+organization key --AES-256-GCM + AAD-->   each item
 ```
 
-## Getting Started
+- Each item is bound to its organization and id with AES-GCM associated data, so the server cannot swap ciphertext between items undetected.
+- Admins approve members by encrypting the org key for the member's public key, after checking the member's key fingerprint out of band.
+- Share links re-encrypt one item under a random key that only exists in the link.
 
-### Prerequisites
+There is **no master password recovery**. That is the point of the design. See [docs/SECURITY.md](docs/SECURITY.md) for the full model, including its limits.
 
-- Node.js 18+
-- Cloudflare account (free tier)
-- GitHub OAuth app (for authentication)
+## What the server can see
 
-### 1. Clone and Install
+| Data | Visible to the server |
+|------|-----------------------|
+| Passwords, notes, card numbers, API keys, 2FA secrets, custom fields | No (encrypted) |
+| Organization keys, private keys, master passwords | No |
+| Item name, website, username, category, tags, expiry date | Yes (for search and reminders) |
+| Who viewed or changed what, and when | Yes (audit log) |
+| Email addresses and public keys | Yes |
+
+Don't put sensitive information in an item's name or website. Use the notes or custom fields instead.
+
+## Tech stack
+
+- **Frontend:** React 18, Vite, Tailwind CSS, Web Crypto API (no crypto dependencies), hosted on Cloudflare Pages
+- **API:** Cloudflare Workers with Hono and Zod
+- **Storage:** Cloudflare D1 (SQLite), the only storage binding
+- **Email:** Resend (optional)
+- **Tests:** Vitest. The API tests run real SQL against the real migrations using Node's built-in SQLite.
+
+## Getting started (local)
+
+Requires Node.js 22+.
 
 ```bash
-cd cloudvault
-
-# Install frontend dependencies
-cd frontend
-npm install
-
-# Install worker dependencies
-cd ../worker
-npm install
+git clone https://github.com/BenSweaterVest/CloudVault.git
+cd CloudVault
+(cd worker && npm install)
+(cd frontend && npm install)
 ```
 
-### 2. Set Up Cloudflare D1 and KV
+Configure the worker:
 
 ```bash
 cd worker
-
-# Create the database
-npx wrangler d1 create cloudvault-db
-# Copy the database_id from the output and update wrangler.toml
-
-# Create KV namespace for rate limiting and session management
-npx wrangler kv:namespace create "RATE_LIMIT"
-# Copy the id from the output and update wrangler.toml
-
-# Run migrations
-npm run db:migrate
+cp .dev.vars.example .dev.vars   # then edit: JWT_SECRET, APP_URL=http://localhost:5173
+npm run db:migrate               # creates the local D1 database
+npm run dev                      # API on http://localhost:8787
 ```
 
-### 3. Configure GitHub OAuth
-
-1. Go to GitHub Settings > Developer Settings > OAuth Apps
-2. Create a new OAuth app:
-   - Homepage URL: `http://localhost:5173` (dev) or your Pages URL
-   - Callback URL: `http://localhost:8787/api/auth/github/callback`
-3. Copy Client ID and Secret
-
-### 4. Set Environment Variables
-
-For local development, create a `.dev.vars` file in the `worker` directory:
-
-```
-GITHUB_CLIENT_ID=your_client_id
-GITHUB_CLIENT_SECRET=your_client_secret
-JWT_SECRET=your_random_secret_here
-APP_URL=http://localhost:5173
-RESEND_API_KEY=your_resend_key  # Optional, for magic links
-```
-
-### 5. Run Locally
-
-```bash
-# Terminal 1: Start the API
-cd worker
-npm run dev
-
-# Terminal 2: Start the frontend
-cd frontend
-npm run dev
-```
-
-Visit `http://localhost:5173` to see the app.
-
-### Development Commands
-
-```bash
-# Frontend
-npm run dev          # Start dev server
-npm run build        # Production build
-npm run lint         # ESLint check
-npm run lint:fix     # Auto-fix lint issues
-npm run typecheck    # TypeScript check
-npm run test         # Run tests
-npm run test:coverage # Tests with coverage
-
-# Worker
-npm run dev          # Start local worker
-npm run deploy       # Deploy to Cloudflare
-npm run typecheck    # TypeScript check
-npm run db:migrate   # Run local migrations
-npm run db:migrate:prod # Run production migrations
-```
-
-## Deployment
-
-### Deploy the Worker
-
-```bash
-cd worker
-
-# Set production secrets
-npx wrangler secret put GITHUB_CLIENT_ID
-npx wrangler secret put GITHUB_CLIENT_SECRET
-npx wrangler secret put JWT_SECRET
-npx wrangler secret put APP_URL
-
-# Deploy
-npm run deploy
-
-# Run production migrations
-npm run db:migrate:prod
-```
-
-### Deploy the Frontend
+In a second terminal:
 
 ```bash
 cd frontend
-npm run build
-
-# Deploy to Cloudflare Pages via dashboard or CLI
-npx wrangler pages deploy dist
+npm run dev                      # app on http://localhost:5173
 ```
 
-## Security Architecture
+Without a Resend key, magic links are printed in the worker's terminal output, so you can sign in by email locally. GitHub sign-in needs an OAuth app whose callback URL is `http://localhost:5173/auth/github/callback`.
 
-### Zero-Knowledge Encryption
+### Commands
 
-1. **User Identity**: Each user has an RSA-OAEP key pair
-   - Public key stored on server
-   - Private key encrypted with master password, stored on server
+| Where | Command | What it does |
+|-------|---------|--------------|
+| both | `npm run lint` / `npm run typecheck` / `npm run test:run` | Checks used by CI |
+| worker | `npm run db:migrate` / `npm run db:migrate:prod` | Apply D1 migrations locally / to production |
+| worker | `npm run deploy` | Deploy the Worker |
+| frontend | `npm run build` | Production build (also writes the Pages `_headers` file with a strict CSP) |
 
-2. **Organization Key**: Each org has an AES-256-GCM key
-   - Encrypted separately for each member using their public key
-   - Stored in `memberships.encrypted_org_key`
+## Deploying
 
-3. **Secrets**: Encrypted with the organization's AES key
-   - Server only sees ciphertext
-   - Decryption happens in browser
+See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**. In short: create a D1 database, set four secrets, apply migrations, deploy the Worker, and deploy the frontend to Pages with `VITE_API_URL` pointing at the Worker. GitHub Actions can do the last three steps on every push to `main`.
 
-### Key Exchange Flow
+Upgrading from 0.2.x? Read the [upgrade notes](CHANGELOG.md#upgrading-from-02x) first. The KV namespace is no longer needed.
 
-When adding a new user:
-1. New user creates account, generates key pair
-2. Admin approves user in their browser
-3. Admin's browser decrypts org key, re-encrypts for new user's public key
-4. Encrypted org key uploaded to server
+## Free plan budget
 
-## Free Tier Limits
+CloudVault is built to stay inside Cloudflare's free limits for a small organization:
 
-| Service | Free Limit | Typical Usage |
-|---------|------------|---------------|
-| Workers | 100k req/day | ~500/day for 20 users |
-| D1 Storage | 5GB | ~10MB for small org |
-| D1 Reads | 5M/day | ~5k/day |
-| Pages | Unlimited | Static hosting |
-| Resend | 100 emails/day | Magic links |
+| Resource | Free limit | How CloudVault uses it |
+|----------|-----------|------------------------|
+| Worker requests | 100,000 / day | A few hundred per active person per day |
+| Worker CPU | 10 ms / request | No slow cryptography on the server; all KDFs run in the browser |
+| D1 rows written | 100,000 / day | Session activity is written at most once a minute; rate limits only on public endpoints |
+| D1 queries | 50 / request | Bulk imports and key rotation are single `json_each` statements |
+| D1 storage | 5 GB | Megabytes for a typical organization; history is capped at 20 versions per item |
+| Cron triggers | 5 | One daily cleanup job |
+| Resend email | 100 / day | Magic links, invitations, emergency notices |
+
+There is no KV, R2 or Durable Objects dependency.
+
+## Project layout
+
+```
+worker/                  Cloudflare Worker (API)
+  migrations/            D1 schema migrations (wrangler d1 migrations)
+  src/
+    index.ts             app, routing, error handling, cron entry
+    env.ts               bindings and context types
+    routes/              auth, orgs (members, key rotation), secrets, categories,
+                         sharing, emergency, settings, audit, preferences
+    middleware/          sessions, rate limiting, security headers, audit logging
+    lib/                 validation (Zod), access control, email, DB helpers
+    scheduled.ts         daily maintenance
+    __tests__/           route tests on a node:sqlite D1 shim
+frontend/                React app (Cloudflare Pages)
+  src/
+    lib/                 crypto, API client, TOTP, passwords, importers, rotation
+    hooks/               vault state, clipboard, idle timeout
+    components/          screens, grouped by area
+    __tests__/
+docs/                    architecture, security, API, deployment, testing, FAQ
+```
 
 ## Documentation
 
-- **[API Reference](docs/API.md)** - Complete API endpoint documentation
-- **[Security](docs/SECURITY.md)** - Cryptographic design and threat model
-- **[Architecture](docs/ARCHITECTURE.md)** - System design and data flow diagrams
-- **[Deployment Guide](docs/DEPLOYMENT.md)** - Step-by-step deployment instructions
-- **[Testing Guide](docs/TESTING.md)** - How to run and write tests
-- **[Contributing](CONTRIBUTING.md)** - How to contribute to the project
-- **[Changelog](CHANGELOG.md)** - Version history and release notes
+- [Security model](docs/SECURITY.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [API reference](docs/API.md)
+- [Deployment](docs/DEPLOYMENT.md)
+- [Testing](docs/TESTING.md)
+- [FAQ](docs/FAQ.md)
+- [Contributing](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md)
 
 ## License
 

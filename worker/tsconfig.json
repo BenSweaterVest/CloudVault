@@ -3,8 +3,12 @@
     "target": "ES2021",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ES2021"],
-    "types": ["@cloudflare/workers-types"],
+    "lib": [
+      "ES2021"
+    ],
+    "types": [
+      "@cloudflare/workers-types"
+    ],
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,
@@ -15,6 +19,11 @@
     "noFallthroughCasesInSwitch": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules"]
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "src/__tests__"
+  ]
 }

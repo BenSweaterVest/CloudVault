@@ -1,200 +1,144 @@
 /**
- * Audit Logging Middleware
- * 
- * Logs all actions to the audit_logs table for governance compliance.
- * Uses waitUntil() for non-blocking writes.
+ * Audit logging.
+ *
+ * Writes go through executionCtx.waitUntil() so they do not add latency to
+ * the response. AUDIT_ACTIONS is the single list of valid actions; the audit
+ * log query schema is derived from it so the two can never drift apart.
  */
 
-import { Context, Next } from 'hono';
-import type { Env, Variables } from '../index';
+import type { AppContext } from '../env';
+import { getClientIp } from '../lib/http';
 
-/**
- * All possible audit actions tracked in the system
- */
-export type AuditAction =
+export const AUDIT_ACTIONS = [
   // Authentication
-  | 'LOGIN'
-  | 'LOGOUT'
-  | 'SETUP_KEYS'
+  'LOGIN',
+  'LOGOUT',
+  'LOGOUT_ALL',
+  'SETUP_KEYS',
+  'CHANGE_MASTER_PASSWORD',
+  'UPDATE_PROFILE',
   // Secrets
-  | 'VIEW_SECRET'
-  | 'CREATE_SECRET'
-  | 'UPDATE_SECRET'
-  | 'DELETE_SECRET'
-  | 'VIEW_SECRET_HISTORY'
-  | 'TOGGLE_FAVORITE'
-  | 'IMPORT_SECRETS'
-  | 'EXPORT_SECRETS'
+  'VIEW_SECRET',
+  'CREATE_SECRET',
+  'UPDATE_SECRET',
+  'DELETE_SECRET',
+  'VIEW_SECRET_HISTORY',
+  'IMPORT_SECRETS',
+  'EXPORT_SECRETS',
   // Organizations
-  | 'CREATE_ORG'
-  | 'UPDATE_ORG'
-  | 'DELETE_ORG'
-  | 'UPDATE_ORG_SETTINGS'
-  // Users
-  | 'INVITE_USER'
-  | 'APPROVE_USER'
-  | 'REMOVE_USER'
-  | 'UPDATE_USER_ROLE'
-  | 'UPDATE_PROFILE'
+  'CREATE_ORG',
+  'UPDATE_ORG',
+  'DELETE_ORG',
+  'UPDATE_ORG_SETTINGS',
+  'ROTATE_ORG_KEY',
+  // Members
+  'INVITE_USER',
+  'APPROVE_USER',
+  'REMOVE_USER',
+  'LEAVE_ORG',
+  'UPDATE_USER_ROLE',
   // Categories
-  | 'CREATE_CATEGORY'
-  | 'UPDATE_CATEGORY'
-  | 'DELETE_CATEGORY'
+  'CREATE_CATEGORY',
+  'UPDATE_CATEGORY',
+  'DELETE_CATEGORY',
   // Sharing
-  | 'CREATE_SHARE_LINK'
-  | 'REVOKE_SHARE_LINK'
-  | 'ACCESS_SHARE_LINK'
-  // Emergency Access
-  | 'ADD_EMERGENCY_CONTACT'
-  | 'REMOVE_EMERGENCY_CONTACT'
-  | 'EMERGENCY_ACCESS_REQUESTED'
-  | 'EMERGENCY_ACCESS_DENIED'
-  | 'EMERGENCY_ACCESS_GRANTED'
+  'CREATE_SHARE_LINK',
+  'REVOKE_SHARE_LINK',
+  'ACCESS_SHARE_LINK',
+  // Emergency access
+  'ADD_EMERGENCY_CONTACT',
+  'REMOVE_EMERGENCY_CONTACT',
+  'EMERGENCY_ACCESS_REQUESTED',
+  'EMERGENCY_ACCESS_APPROVED',
+  'EMERGENCY_ACCESS_DENIED',
+  'EMERGENCY_ACCESS_GRANTED',
   // Audit
-  | 'VIEW_AUDIT_LOG'
-  | 'EXPORT_AUDIT_LOG';
+  'VIEW_AUDIT_LOG',
+  'EXPORT_AUDIT_LOG',
+] as const;
 
-/**
- * Types of entities that can be targets of audit actions
- */
-export type TargetType = 
-  | 'secret' 
-  | 'user' 
-  | 'org'
-  | 'organization' 
-  | 'membership' 
+export type AuditAction = (typeof AUDIT_ACTIONS)[number];
+
+export type TargetType =
+  | 'secret'
+  | 'user'
+  | 'organization'
+  | 'membership'
   | 'category'
   | 'share_link'
   | 'emergency_contact'
   | 'emergency_request';
 
-interface AuditLogEntry {
-  orgId?: string;
-  userId: string;
-  userEmail: string;
+export interface AuditEntry {
+  orgId?: string | null;
+  userId?: string | null;
+  userEmail?: string | null;
   action: AuditAction;
   targetType?: TargetType;
   targetId?: string;
   targetName?: string;
   metadata?: Record<string, unknown>;
-  ipAddress?: string;
-  userAgent?: string;
+  ipAddress?: string | null;
+  userAgent?: string | null;
 }
 
-/**
- * Log an audit event to the database
- */
-export async function logAuditEvent(
-  db: D1Database,
-  entry: AuditLogEntry
-): Promise<void> {
+/** Build the INSERT statement for an audit entry (usable in D1 batches). */
+export function auditStatement(db: D1Database, entry: AuditEntry): D1PreparedStatement {
+  return db
+    .prepare(
+      `INSERT INTO audit_logs (org_id, user_id, user_email, action, target_type, target_id, target_name, metadata, ip_address, user_agent)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      entry.orgId ?? null,
+      entry.userId ?? null,
+      entry.userEmail ?? null,
+      entry.action,
+      entry.targetType ?? null,
+      entry.targetId ?? null,
+      entry.targetName ?? null,
+      entry.metadata ? JSON.stringify(entry.metadata) : null,
+      entry.ipAddress ?? null,
+      entry.userAgent?.slice(0, 300) ?? null
+    );
+}
+
+/** Write an audit entry. Never throws. */
+export async function logAuditEvent(db: D1Database, entry: AuditEntry): Promise<void> {
   try {
-    await db
-      .prepare(
-        `INSERT INTO audit_logs (
-          org_id, user_id, user_email, action, target_type, target_id, target_name, metadata, ip_address, user_agent
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .bind(
-        entry.orgId || null,
-        entry.userId,
-        entry.userEmail,
-        entry.action,
-        entry.targetType || null,
-        entry.targetId || null,
-        entry.targetName || null,
-        entry.metadata ? JSON.stringify(entry.metadata) : null,
-        entry.ipAddress || null,
-        entry.userAgent || null
-      )
-      .run();
+    await auditStatement(db, entry).run();
   } catch (err) {
-    console.error('Failed to log audit event:', err);
-    // Don't throw - audit logging should not break the main request
+    console.error('Failed to write audit log:', err instanceof Error ? err.message : 'unknown');
   }
 }
 
 /**
- * Create an audit logger for a specific request context
+ * Audit logger bound to the current request. Fills in the acting user, IP
+ * address and user agent, and writes in the background.
  */
-export function createAuditLogger(
-  c: Context<{ Bindings: Env; Variables: Variables }>
-) {
+export function createAuditLogger(c: AppContext) {
   const user = c.get('user');
-  const ipAddress = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For');
-  const userAgent = c.req.header('User-Agent');
-  
+  const base = {
+    userId: user?.id ?? null,
+    userEmail: user?.email ?? null,
+    ipAddress: getClientIp(c),
+    userAgent: c.req.header('User-Agent') ?? null,
+  };
+
   return {
-    /**
-     * Log an event in the background (non-blocking)
-     */
-    log(
-      action: AuditAction,
-      options?: {
-        orgId?: string;
-        targetType?: TargetType;
-        targetId?: string;
-        targetName?: string;
-        metadata?: Record<string, unknown>;
-      }
-    ): void {
-      if (!user) return;
-      
-      c.executionCtx.waitUntil(
-        logAuditEvent(c.env.DB, {
-          orgId: options?.orgId,
-          userId: user.id,
-          userEmail: user.email,
-          action,
-          targetType: options?.targetType,
-          targetId: options?.targetId,
-          targetName: options?.targetName,
-          metadata: options?.metadata,
-          ipAddress: ipAddress || undefined,
-          userAgent: userAgent || undefined,
-        })
-      );
+    /** Full entry with request details, for use in a batch. */
+    entry(action: AuditAction, options: Omit<AuditEntry, 'action'> = {}): AuditEntry {
+      return { ...base, ...options, action };
     },
-    
-    /**
-     * Log an event synchronously (blocking)
-     */
-    async logSync(
-      action: AuditAction,
-      options?: {
-        orgId?: string;
-        targetType?: TargetType;
-        targetId?: string;
-        targetName?: string;
-        metadata?: Record<string, unknown>;
+    /** Log in the background. */
+    log(action: AuditAction, options: Omit<AuditEntry, 'action'> = {}): void {
+      const write = logAuditEvent(c.env.DB, { ...base, ...options, action });
+      try {
+        c.executionCtx.waitUntil(write);
+      } catch {
+        // No execution context (for example in some test setups): the
+        // promise still runs, we just cannot extend the request lifetime.
       }
-    ): Promise<void> {
-      if (!user) return;
-      
-      await logAuditEvent(c.env.DB, {
-        orgId: options?.orgId,
-        userId: user.id,
-        userEmail: user.email,
-        action,
-        targetType: options?.targetType,
-        targetId: options?.targetId,
-        targetName: options?.targetName,
-        metadata: options?.metadata,
-        ipAddress: ipAddress || undefined,
-        userAgent: userAgent || undefined,
-      });
     },
   };
-}
-
-/**
- * Automatic audit middleware that logs based on route patterns
- */
-export function auditMiddleware(
-  _c: Context<{ Bindings: Env; Variables: Variables }>,
-  next: Next
-) {
-  // The actual logging is done in individual route handlers using createAuditLogger
-  // This middleware could be extended to do automatic logging based on HTTP methods
-  return next();
 }

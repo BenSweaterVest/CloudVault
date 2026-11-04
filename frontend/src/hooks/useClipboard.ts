@@ -1,89 +1,86 @@
 /**
- * Clipboard Hook with Auto-Clear
- * 
- * Copies text to clipboard and optionally clears it after a delay.
+ * Copy to clipboard with automatic clearing.
+ *
+ * The clear delay defaults to the user's "clear clipboard" preference. When
+ * the timer fires, the clipboard is cleared if it still holds what we copied.
+ * If the browser will not let us read the clipboard to check, it is cleared
+ * anyway: leaving a password behind is worse than clearing something newer.
  */
 
-import { useState, useCallback, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { usePreferences } from '../lib/preferences';
 
 interface UseClipboardOptions {
-  clearAfterSeconds?: number; // 0 = disabled
-  onCopy?: () => void;
-  onClear?: () => void;
+  /** Seconds before clearing. Defaults to the user preference. 0 disables. */
+  clearAfterSeconds?: number;
 }
 
 interface UseClipboardReturn {
-  copied: boolean;
-  copy: (text: string) => Promise<void>;
-  clear: () => void;
+  /** Key of the most recently copied item, for "Copied" feedback (2 s). */
+  copiedKey: string | null;
+  copy: (text: string, key?: string) => Promise<boolean>;
+  clearAfterSeconds: number;
 }
 
-export function useClipboard({
-  clearAfterSeconds = 30,
-  onCopy,
-  onClear,
-}: UseClipboardOptions = {}): UseClipboardReturn {
-  const [copied, setCopied] = useState(false);
-  const timeoutRef = useRef<number | null>(null);
-  const lastCopiedRef = useRef<string>('');
+/** Pending clear shared by every hook instance, so the latest copy wins. */
+let pendingClear: { timer: number; text: string } | null = null;
 
-  const clear = useCallback(async () => {
-    try {
-      // Only clear if the clipboard still contains what we copied
-      const currentClipboard = await navigator.clipboard.readText();
-      if (currentClipboard === lastCopiedRef.current) {
-        await navigator.clipboard.writeText('');
-        onClear?.();
-      }
-    } catch {
-      // Clipboard API might fail if page is not focused
-      // Just clear our state
-    }
-    
-    setCopied(false);
-    lastCopiedRef.current = '';
-    
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-  }, [onClear]);
+async function clearIfUnchanged(text: string) {
+  try {
+    const current = await navigator.clipboard.readText();
+    if (current !== text) return;
+  } catch {
+    // Cannot read (permission or focus): clear anyway.
+  }
+  try {
+    await navigator.clipboard.writeText('');
+  } catch {
+    // Page not focused; nothing more we can do.
+  }
+}
 
-  const copy = useCallback(async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      lastCopiedRef.current = text;
-      setCopied(true);
-      onCopy?.();
+export function useClipboard(options: UseClipboardOptions = {}): UseClipboardReturn {
+  const { preferences } = usePreferences();
+  const clearAfterSeconds = options.clearAfterSeconds ?? preferences.clipboardClear;
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const feedbackTimer = useRef<number | null>(null);
 
-      // Clear any existing timeout
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
+  useEffect(
+    () => () => {
+      if (feedbackTimer.current) window.clearTimeout(feedbackTimer.current);
+    },
+    []
+  );
+
+  const copy = useCallback(
+    async (text: string, key = 'default') => {
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        return false;
       }
 
-      // Set up auto-clear
+      setCopiedKey(key);
+      if (feedbackTimer.current) window.clearTimeout(feedbackTimer.current);
+      feedbackTimer.current = window.setTimeout(() => setCopiedKey(null), 2000);
+
+      if (pendingClear) window.clearTimeout(pendingClear.timer);
+      pendingClear = null;
       if (clearAfterSeconds > 0) {
-        timeoutRef.current = window.setTimeout(() => {
-          clear();
+        const timer = window.setTimeout(() => {
+          pendingClear = null;
+          void clearIfUnchanged(text);
         }, clearAfterSeconds * 1000);
+        pendingClear = { timer, text };
       }
+      return true;
+    },
+    [clearAfterSeconds]
+  );
 
-      // Reset copied state after 2 seconds (for UI feedback)
-      setTimeout(() => {
-        setCopied(false);
-      }, 2000);
-    } catch (err) {
-      console.error('Failed to copy to clipboard:', err);
-      throw err;
-    }
-  }, [clearAfterSeconds, clear, onCopy]);
-
-  return { copied, copy, clear };
+  return { copiedKey, copy, clearAfterSeconds };
 }
 
-/**
- * Format remaining time for display
- */
 export function formatClearTime(seconds: number): string {
   if (seconds <= 0) return '';
   if (seconds < 60) return `${seconds}s`;

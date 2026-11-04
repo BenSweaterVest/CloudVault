@@ -1,183 +1,147 @@
+// @vitest-environment node
 /**
- * Crypto Module Tests
- * 
- * Tests for the zero-knowledge encryption utilities.
+ * Crypto library tests. Run in the Node environment: Web Crypto there uses
+ * the same realm as the test's typed arrays (jsdom does not).
  */
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
-  generateMasterKeyFromPassword,
-  deriveKeyFromPassword,
+  CURRENT_KDF_ITERATIONS,
+  bufferToHex,
+  createOrganizationKeys,
+  createShareAccessVerifier,
+  createSharePackage,
+  decryptOrgKey,
+  decryptSecretPayload,
+  deriveShareAccessToken,
+  encryptOrgKeyFor,
+  encryptSecretPayload,
+  exportPublicKey,
   generateKeyPair,
-  generateOrgKey,
-  encryptWithOrgKey,
-  decryptWithOrgKey,
-  encryptOrgKeyForUser,
-  decryptOrgKeyWithPrivateKey,
-  encryptPrivateKey,
-  decryptPrivateKey,
+  hexToBytes,
+  keyFingerprint,
+  normalizePayload,
+  openSharePackage,
+  publicKeyFromPrivateKey,
+  randomBytes,
+  setupUserKeys,
+  sha256Hex,
+  unwrapPrivateKey,
+  wrapPrivateKey,
 } from '../lib/crypto';
 
-describe('Crypto Module', () => {
-  const testPassword = 'TestPassword123!';
-  const testSalt = 'test-salt-123456';
-  const testData = { username: 'testuser', password: 'secretpassword' };
+const ORG = '11111111-1111-4111-8111-111111111111';
+const SECRET = '22222222-2222-4222-8222-222222222222';
+const FAST = 100_000;
 
-  describe('Key Derivation', () => {
-    it('should derive a consistent key from password and salt', async () => {
-      const key1 = await deriveKeyFromPassword(testPassword, testSalt);
-      const key2 = await deriveKeyFromPassword(testPassword, testSalt);
-      
-      // Export keys to compare
-      const exported1 = await crypto.subtle.exportKey('raw', key1);
-      const exported2 = await crypto.subtle.exportKey('raw', key2);
-      
-      expect(new Uint8Array(exported1)).toEqual(new Uint8Array(exported2));
-    });
+describe('encoding', () => {
+  it('round-trips hex and rejects bad input', () => {
+    const bytes = randomBytes(16);
+    expect(hexToBytes(bufferToHex(bytes))).toEqual(bytes);
+    expect(() => hexToBytes('abc')).toThrow();
+    expect(() => hexToBytes('zz')).toThrow();
+  });
+});
 
-    it('should derive different keys for different passwords', async () => {
-      const key1 = await deriveKeyFromPassword(testPassword, testSalt);
-      const key2 = await deriveKeyFromPassword('DifferentPassword456!', testSalt);
-      
-      const exported1 = await crypto.subtle.exportKey('raw', key1);
-      const exported2 = await crypto.subtle.exportKey('raw', key2);
-      
-      expect(new Uint8Array(exported1)).not.toEqual(new Uint8Array(exported2));
-    });
+describe('user keys', () => {
+  it('sets up keys with the current KDF and unlocks only with the right password', async () => {
+    const keys = await setupUserKeys('correct horse battery staple');
+    expect(keys.kdfIterations).toBe(CURRENT_KDF_ITERATIONS);
 
-    it('should derive different keys for different salts', async () => {
-      const key1 = await deriveKeyFromPassword(testPassword, testSalt);
-      const key2 = await deriveKeyFromPassword(testPassword, 'different-salt-789');
-      
-      const exported1 = await crypto.subtle.exportKey('raw', key1);
-      const exported2 = await crypto.subtle.exportKey('raw', key2);
-      
-      expect(new Uint8Array(exported1)).not.toEqual(new Uint8Array(exported2));
-    });
+    const privateKey = await unwrapPrivateKey(keys.encryptedPrivateKey, keys.salt, 'correct horse battery staple', keys.kdfIterations);
+    expect(await publicKeyFromPrivateKey(privateKey)).toBe(keys.publicKey);
+
+    await expect(unwrapPrivateKey(keys.encryptedPrivateKey, keys.salt, 'wrong password', keys.kdfIterations)).rejects.toThrow();
+  }, 30_000);
+
+  it('re-wraps a key under a new password and iteration count (master password change)', async () => {
+    const pair = await generateKeyPair();
+    const legacy = await wrapPrivateKey(pair.privateKey, 'old password', FAST);
+    const unlocked = await unwrapPrivateKey(legacy.encryptedPrivateKey, legacy.salt, 'old password', FAST);
+    const upgraded = await wrapPrivateKey(unlocked, 'new password', 200_000);
+    expect(upgraded.salt).not.toBe(legacy.salt);
+    const again = await unwrapPrivateKey(upgraded.encryptedPrivateKey, upgraded.salt, 'new password', 200_000);
+    expect(await publicKeyFromPrivateKey(again)).toBe(await exportPublicKey(pair.publicKey));
+  }, 30_000);
+
+  it('formats fingerprints as eight groups of four hex digits', async () => {
+    const pair = await generateKeyPair();
+    const fp = await keyFingerprint(await exportPublicKey(pair.publicKey));
+    expect(fp).toMatch(/^([0-9A-F]{4} ){7}[0-9A-F]{4}$/);
+  }, 30_000);
+});
+
+describe('organization flow', () => {
+  it('lets an admin share the org key with a member who can then decrypt', async () => {
+    const admin = await generateKeyPair();
+    const member = await generateKeyPair();
+    const { orgKey, encryptedOrgKey } = await createOrganizationKeys(await exportPublicKey(admin.publicKey));
+
+    const adminCopy = await decryptOrgKey(encryptedOrgKey, admin.privateKey);
+    const forMember = await encryptOrgKeyFor(adminCopy, await exportPublicKey(member.publicKey));
+    const memberCopy = await decryptOrgKey(forMember, member.privateKey);
+
+    const enc = await encryptSecretPayload({ username: 'treasurer', password: 's3cret!' }, orgKey, ORG, SECRET);
+    expect(enc.encVersion).toBe(2);
+    expect(await decryptSecretPayload(enc, memberCopy, ORG, SECRET)).toMatchObject({ username: 'treasurer', password: 's3cret!' });
+    await expect(decryptOrgKey(forMember, admin.privateKey)).rejects.toThrow();
+  }, 30_000);
+});
+
+describe('secret payloads', () => {
+  it('binds format 2 ciphertext to its org and secret id', async () => {
+    const { orgKey } = await createOrganizationKeys(await exportPublicKey((await generateKeyPair()).publicKey));
+    const enc = await encryptSecretPayload({ password: 'x' }, orgKey, ORG, SECRET);
+    await expect(decryptSecretPayload(enc, orgKey, ORG, '33333333-3333-4333-8333-333333333333')).rejects.toThrow();
+    await expect(decryptSecretPayload(enc, orgKey, '44444444-4444-4444-8444-444444444444', SECRET)).rejects.toThrow();
+  }, 30_000);
+
+  it('still reads legacy format 1 (no associated data)', async () => {
+    const orgKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    const iv = randomBytes(12);
+    const legacy = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      orgKey,
+      new TextEncoder().encode(JSON.stringify({ username: 'old', password: 'pw', notes: 'n', totpSecret: 'JBSWY3DPEHPK3PXP' }))
+    );
+    const payload = await decryptSecretPayload({ ciphertextBlob: bufferToHex(legacy), iv: bufferToHex(iv), encVersion: 1 }, orgKey, ORG, SECRET);
+    expect(payload).toMatchObject({ username: 'old', password: 'pw', notes: 'n', totp: 'JBSWY3DPEHPK3PXP' });
   });
 
-  describe('RSA Key Pair', () => {
-    it('should generate a valid RSA key pair', async () => {
-      const { publicKey, privateKey } = await generateKeyPair();
-      
-      expect(publicKey).toBeDefined();
-      expect(privateKey).toBeDefined();
-      expect(publicKey.type).toBe('public');
-      expect(privateKey.type).toBe('private');
-    });
+  it('produces a fresh IV every time', async () => {
+    const orgKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    const a = await encryptSecretPayload({ password: 'same' }, orgKey, ORG, SECRET);
+    const b = await encryptSecretPayload({ password: 'same' }, orgKey, ORG, SECRET);
+    expect(a.iv).not.toBe(b.iv);
+    expect(a.iv).toMatch(/^[0-9a-f]{24}$/);
   });
 
-  describe('Organization Key Encryption', () => {
-    it('should generate a valid org key', async () => {
-      const orgKey = await generateOrgKey();
-      
-      expect(orgKey).toBeDefined();
-      expect(orgKey.type).toBe('secret');
-    });
-
-    it('should encrypt and decrypt data with org key', async () => {
-      const orgKey = await generateOrgKey();
-      
-      const { ciphertext, iv } = await encryptWithOrgKey(orgKey, testData);
-      
-      expect(ciphertext).toBeDefined();
-      expect(iv).toBeDefined();
-      expect(ciphertext.length).toBeGreaterThan(0);
-      expect(iv.length).toBeGreaterThan(0);
-      
-      const decrypted = await decryptWithOrgKey(orgKey, ciphertext, iv);
-      
-      expect(decrypted).toEqual(testData);
-    });
-
-    it('should fail to decrypt with wrong org key', async () => {
-      const orgKey1 = await generateOrgKey();
-      const orgKey2 = await generateOrgKey();
-      
-      const { ciphertext, iv } = await encryptWithOrgKey(orgKey1, testData);
-      
-      await expect(
-        decryptWithOrgKey(orgKey2, ciphertext, iv)
-      ).rejects.toThrow();
+  it('normalizes unknown or malformed payloads', () => {
+    expect(normalizePayload({ password: 1, card: { number: '4111' }, customFields: [{ label: 'PIN', value: 12, hidden: 1 }, null] })).toEqual({
+      username: undefined,
+      password: undefined,
+      notes: undefined,
+      totp: undefined,
+      apiKey: undefined,
+      card: { holder: undefined, number: '4111', expiry: undefined, cvv: undefined, pin: undefined },
+      customFields: [{ label: 'PIN', value: '12', hidden: true }],
     });
   });
+});
 
-  describe('Private Key Encryption', () => {
-    it('should encrypt and decrypt private key with master password', async () => {
-      const { publicKey, privateKey } = await generateKeyPair();
-      const { key, salt } = await generateMasterKeyFromPassword(testPassword);
-      
-      const encryptedPrivateKey = await encryptPrivateKey(privateKey, key);
-      
-      expect(encryptedPrivateKey).toBeDefined();
-      
-      const decryptedPrivateKey = await decryptPrivateKey(encryptedPrivateKey, key);
-      
-      // Compare exported key data
-      const originalExported = await crypto.subtle.exportKey('pkcs8', privateKey);
-      const decryptedExported = await crypto.subtle.exportKey('pkcs8', decryptedPrivateKey);
-      
-      expect(new Uint8Array(originalExported)).toEqual(new Uint8Array(decryptedExported));
-    });
+describe('share links', () => {
+  it('round-trips with the fragment key and is bound to the link id', async () => {
+    const pkg = await createSharePackage({ password: 'wifi-password' }, 'link-1');
+    expect(pkg.fragmentKey).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(await openSharePackage(pkg, pkg.fragmentKey, 'link-1')).toMatchObject({ password: 'wifi-password' });
+    await expect(openSharePackage(pkg, pkg.fragmentKey, 'link-2')).rejects.toThrow();
+    await expect(openSharePackage(pkg, 'A'.repeat(43), 'link-1')).rejects.toThrow();
   });
 
-  describe('End-to-End Encryption Flow', () => {
-    it('should handle full encryption/decryption workflow', async () => {
-      // 1. Generate user key pair
-      const { publicKey, privateKey } = await generateKeyPair();
-      
-      // 2. Generate master key from password
-      const { key: masterKey, salt } = await generateMasterKeyFromPassword(testPassword);
-      
-      // 3. Encrypt private key with master key
-      const encryptedPrivateKey = await encryptPrivateKey(privateKey, masterKey);
-      
-      // 4. Generate org key
-      const orgKey = await generateOrgKey();
-      
-      // 5. Encrypt org key for user
-      const encryptedOrgKey = await encryptOrgKeyForUser(orgKey, publicKey);
-      
-      // 6. Encrypt secret with org key
-      const { ciphertext, iv } = await encryptWithOrgKey(orgKey, testData);
-      
-      // Now simulate a different session where user logs in
-      
-      // 7. Derive master key from password
-      const derivedMasterKey = await deriveKeyFromPassword(testPassword, salt);
-      
-      // 8. Decrypt private key
-      const decryptedPrivateKey = await decryptPrivateKey(encryptedPrivateKey, derivedMasterKey);
-      
-      // 9. Decrypt org key with private key
-      const decryptedOrgKey = await decryptOrgKeyWithPrivateKey(encryptedOrgKey, decryptedPrivateKey);
-      
-      // 10. Decrypt secret
-      const decryptedData = await decryptWithOrgKey(decryptedOrgKey, ciphertext, iv);
-      
-      expect(decryptedData).toEqual(testData);
-    });
-  });
-
-  describe('Security Properties', () => {
-    it('should produce different ciphertext for same data (random IV)', async () => {
-      const orgKey = await generateOrgKey();
-      
-      const result1 = await encryptWithOrgKey(orgKey, testData);
-      const result2 = await encryptWithOrgKey(orgKey, testData);
-      
-      // Same data should produce different ciphertext due to random IV
-      expect(result1.ciphertext).not.toBe(result2.ciphertext);
-      expect(result1.iv).not.toBe(result2.iv);
-    });
-
-    it('should have proper IV length (96 bits for GCM)', async () => {
-      const orgKey = await generateOrgKey();
-      const { iv } = await encryptWithOrgKey(orgKey, testData);
-      
-      // IV is base64 encoded, 12 bytes = 16 base64 characters
-      const ivBytes = Uint8Array.from(atob(iv), c => c.charCodeAt(0));
-      expect(ivBytes.length).toBe(12);
-    });
+  it('derives a password verifier the server can check without the password', async () => {
+    const { accessSalt, accessVerifier } = await createShareAccessVerifier('hunter22');
+    const token = await deriveShareAccessToken('hunter22', accessSalt);
+    expect(await sha256Hex(token)).toBe(accessVerifier);
+    expect(await sha256Hex(await deriveShareAccessToken('hunter23', accessSalt))).not.toBe(accessVerifier);
   });
 });

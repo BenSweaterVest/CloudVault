@@ -1,506 +1,384 @@
 /**
- * Authentication Routes
- * 
- * Handles GitHub OAuth, Magic Links, and user session management.
- * 
- * @module routes/auth
+ * Authentication routes: GitHub OAuth, magic links, sessions and the user's
+ * own key material.
+ *
+ * Mounted at /api/auth.
  */
 
 import { Hono } from 'hono';
-import type { Env, Variables } from '../index';
-import { createToken, authMiddleware, blacklistToken, getJwtPayload } from '../middleware/auth';
-import { logAuditEvent } from '../middleware/audit';
-import { authRateLimit, passwordResetRateLimit } from '../middleware/rateLimit';
-import { 
-  validateBody, 
-  githubCallbackSchema, 
-  magicLinkRequestSchema, 
+import type { AppContext, AppEnv } from '../env';
+import { authMiddleware, createSession, revokeAllSessions, revokeSession } from '../middleware/auth';
+import { createAuditLogger, logAuditEvent } from '../middleware/audit';
+import { authRateLimit, hitCounter, magicLinkRateLimit } from '../middleware/rateLimit';
+import { getClientIp, getSession, getUser, HttpError, nowSeconds } from '../lib/http';
+import { randomToken, sha256Hex } from '../lib/crypto';
+import { emailButton, emailLayout, sendEmail } from '../lib/email';
+import {
+  changeMasterPasswordSchema,
+  githubCallbackSchema,
+  magicLinkRequestSchema,
   magicLinkVerifySchema,
-  setupKeysSchema 
+  setupKeysSchema,
+  updateProfileSchema,
+  validateBody,
 } from '../lib/validation';
 
-export const authRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
+export const authRoutes = new Hono<AppEnv>();
 
-// Apply rate limiting to all auth routes
 authRoutes.use('*', authRateLimit);
+
+// ============================================
+// SHARED HELPERS
+// ============================================
+
+interface UserRow {
+  id: string;
+  email: string;
+  name: string | null;
+  public_key: string | null;
+  encrypted_private_key: string | null;
+  salt: string | null;
+  kdf_iterations: number;
+  auth_provider: string;
+  github_id: string | null;
+  created_at: string;
+}
+
+export function serializeUser(u: UserRow) {
+  return {
+    id: u.id,
+    email: u.email,
+    name: u.name,
+    publicKey: u.public_key,
+    encryptedPrivateKey: u.encrypted_private_key,
+    salt: u.salt,
+    kdfIterations: u.kdf_iterations,
+    authProvider: u.auth_provider,
+    createdAt: u.created_at,
+  };
+}
+
+async function getUserRow(db: D1Database, userId: string): Promise<UserRow | null> {
+  return db.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first<UserRow>();
+}
+
+function signupsAllowed(c: AppContext): boolean {
+  return c.env.ALLOW_SIGNUPS !== 'false';
+}
+
+/** Create a session for `user` and build the standard login response. */
+async function completeLogin(c: AppContext, user: UserRow, provider: string, isNewAccount: boolean) {
+  const { token, expiresAt } = await createSession(c, { id: user.id, email: user.email, name: user.name });
+
+  await logAuditEvent(c.env.DB, {
+    userId: user.id,
+    userEmail: user.email,
+    action: 'LOGIN',
+    metadata: { provider, isNewAccount },
+    ipAddress: getClientIp(c),
+    userAgent: c.req.header('User-Agent'),
+  });
+
+  return c.json({
+    token,
+    expiresAt,
+    user: serializeUser(user),
+    needsKeySetup: !user.public_key,
+  });
+}
+
+// ============================================
+// CONFIGURATION
+// ============================================
+
+/** Which sign-in methods this deployment offers (for the login screen). */
+authRoutes.get('/config', (c) => {
+  return c.json({
+    github: !!(c.env.GITHUB_CLIENT_ID && c.env.GITHUB_CLIENT_SECRET),
+    // Without Resend, links are only printed to the log, which is useful in development.
+    magicLink: !!c.env.RESEND_API_KEY || c.env.ENVIRONMENT !== 'production',
+    signupsAllowed: signupsAllowed(c),
+  });
+});
+
+function requireGitHub(c: AppContext): { clientId: string; clientSecret: string } {
+  if (!c.env.GITHUB_CLIENT_ID || !c.env.GITHUB_CLIENT_SECRET) {
+    throw new HttpError(503, 'GitHub sign-in is not configured on this server');
+  }
+  return { clientId: c.env.GITHUB_CLIENT_ID, clientSecret: c.env.GITHUB_CLIENT_SECRET };
+}
 
 // ============================================
 // GITHUB OAUTH
 // ============================================
 
 /**
- * Redirect to GitHub OAuth
+ * Start GitHub OAuth.
+ *
+ * The frontend generates a random `state`, stores it in sessionStorage and
+ * navigates here. The callback page compares the returned state with the
+ * stored one before exchanging the code, which prevents login CSRF.
  */
 authRoutes.get('/github', (c) => {
-  const clientId = c.env.GITHUB_CLIENT_ID;
-  const redirectUri = `${c.env.APP_URL}/auth/github/callback`;
-  
+  const { clientId } = requireGitHub(c);
+  const state = c.req.query('state') ?? '';
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(state)) {
+    throw new HttpError(400, 'Missing or invalid state parameter');
+  }
+
   const params = new URLSearchParams({
     client_id: clientId,
-    redirect_uri: redirectUri,
-    scope: 'user:email',
-    state: crypto.randomUUID(), // CSRF protection
+    redirect_uri: `${new URL(c.env.APP_URL).origin}/auth/github/callback`,
+    scope: 'read:user user:email',
+    state,
+    allow_signup: 'true',
   });
-  
   return c.redirect(`https://github.com/login/oauth/authorize?${params}`);
 });
 
-/**
- * GitHub OAuth callback
- * 
- * @route POST /github/callback
- * @body {string} code - GitHub authorization code
- */
 authRoutes.post('/github/callback', async (c) => {
+  const { clientId, clientSecret } = requireGitHub(c);
   const { code } = await validateBody(c, githubCallbackSchema);
-  
-  // Exchange code for access token
+
   const tokenResponse = await fetch('https://github.com/login/oauth/access_token', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({
-      client_id: c.env.GITHUB_CLIENT_ID,
-      client_secret: c.env.GITHUB_CLIENT_SECRET,
+      client_id: clientId,
+      client_secret: clientSecret,
       code,
     }),
   });
-  
-  const tokenData = await tokenResponse.json() as { access_token?: string; error?: string };
-  
+  const tokenData = (await tokenResponse.json().catch(() => ({}))) as { access_token?: string; error?: string };
   if (!tokenData.access_token) {
-    console.error('GitHub token exchange failed:', tokenData.error || 'unknown error');
-    return c.json({ error: 'Failed to authenticate with GitHub' }, 400);
+    console.error('GitHub token exchange failed:', tokenData.error ?? 'unknown error');
+    throw new HttpError(400, 'Failed to authenticate with GitHub');
   }
-  
-  // Get user info from GitHub
-  const userResponse = await fetch('https://api.github.com/user', {
-    headers: {
-      Authorization: `Bearer ${tokenData.access_token}`,
-      Accept: 'application/json',
-    },
-  });
-  
-  const githubUser = await userResponse.json() as {
-    id: number;
-    login: string;
-    email: string | null;
-    name: string | null;
-  };
-  
-  // Get email if not public
-  let email = githubUser.email;
-  if (!email) {
-    const emailsResponse = await fetch('https://api.github.com/user/emails', {
-      headers: {
-        Authorization: `Bearer ${tokenData.access_token}`,
-        Accept: 'application/json',
-      },
-    });
-    
-    const emails = await emailsResponse.json() as Array<{
-      email: string;
-      primary: boolean;
-      verified: boolean;
-    }>;
-    
-    const primaryEmail = emails.find((e) => e.primary && e.verified);
-    email = primaryEmail?.email || emails[0]?.email;
-  }
-  
-  if (!email) {
-    return c.json({ error: 'Could not get email from GitHub' }, 400);
-  }
-  
-  // Check if user exists
-  const existingUser = await c.env.DB.prepare(
-    'SELECT * FROM users WHERE github_id = ? OR email = ?'
-  )
-    .bind(githubUser.id.toString(), email)
-    .first<{
-      id: string;
-      email: string;
-      name: string | null;
-      public_key: string | null;
-      encrypted_private_key: string | null;
-      salt: string | null;
-      auth_provider: string;
-      github_id: string | null;
-    }>();
-  
-  let user: typeof existingUser;
-  let isNewUser = false;
-  
-  if (existingUser) {
-    // Update GitHub ID if missing
-    if (!existingUser.github_id) {
-      await c.env.DB.prepare('UPDATE users SET github_id = ? WHERE id = ?')
-        .bind(githubUser.id.toString(), existingUser.id)
-        .run();
-    }
-    user = existingUser;
-  } else {
-    // Create new user
-    const userId = crypto.randomUUID();
-    await c.env.DB.prepare(
-      `INSERT INTO users (id, email, name, auth_provider, github_id) VALUES (?, ?, ?, 'github', ?)`
-    )
-      .bind(userId, email, githubUser.name || githubUser.login, githubUser.id.toString())
-      .run();
-    
-    user = {
-      id: userId,
-      email,
-      name: githubUser.name || githubUser.login,
-      public_key: null,
-      encrypted_private_key: null,
-      salt: null,
-      auth_provider: 'github',
-      github_id: githubUser.id.toString(),
-    };
-    isNewUser = true;
-  }
-  
-  // Fetch session timeout preference for caching in JWT
-  const prefs = await c.env.DB.prepare(
-    'SELECT session_timeout FROM user_preferences WHERE user_id = ?'
-  )
-    .bind(user.id)
-    .first<{ session_timeout: number }>();
 
-  // Create JWT with cached session timeout
-  const token = await createToken(
-    { id: user.id, email: user.email, name: user.name },
-    c.env.JWT_SECRET,
-    prefs?.session_timeout
-  );
-  
-  // Log audit event
-  await logAuditEvent(c.env.DB, {
-    userId: user.id,
-    userEmail: user.email,
-    action: 'LOGIN',
-    metadata: { provider: 'github', isNewUser },
-    ipAddress: c.req.header('CF-Connecting-IP') || undefined,
-    userAgent: c.req.header('User-Agent') || undefined,
-  });
-  
-  return c.json({
-    token,
-    user: {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      publicKey: user.public_key,
-      encryptedPrivateKey: user.encrypted_private_key,
-      salt: user.salt,
-      authProvider: user.auth_provider,
-      createdAt: new Date().toISOString(),
-    },
-    isNewUser: isNewUser || !user.public_key,
-  });
+  const ghHeaders = {
+    Authorization: `Bearer ${tokenData.access_token}`,
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'CloudVault',
+  };
+
+  const [userResponse, emailsResponse] = await Promise.all([
+    fetch('https://api.github.com/user', { headers: ghHeaders }),
+    fetch('https://api.github.com/user/emails', { headers: ghHeaders }),
+  ]);
+  if (!userResponse.ok || !emailsResponse.ok) {
+    throw new HttpError(400, 'Failed to read GitHub profile');
+  }
+
+  const githubUser = (await userResponse.json()) as { id: number; login: string; name: string | null };
+  const emails = (await emailsResponse.json()) as Array<{ email: string; primary: boolean; verified: boolean }>;
+
+  // Only a verified primary address proves ownership. An unverified address
+  // must never be used to find (and so take over) an existing account.
+  const primary = Array.isArray(emails) ? emails.find((e) => e.primary && e.verified) : undefined;
+  if (!primary) {
+    throw new HttpError(400, 'Your GitHub account needs a verified primary email address');
+  }
+  const email = primary.email.toLowerCase();
+  const githubId = String(githubUser.id);
+  const displayName = githubUser.name || githubUser.login;
+
+  let user = await c.env.DB.prepare('SELECT * FROM users WHERE github_id = ?').bind(githubId).first<UserRow>();
+  let isNewAccount = false;
+
+  if (!user) {
+    const byEmail = await c.env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first<UserRow>();
+    if (byEmail) {
+      if (byEmail.github_id && byEmail.github_id !== githubId) {
+        throw new HttpError(409, 'This email is already linked to a different GitHub account');
+      }
+      // Same verified email: link this GitHub account to the existing user.
+      await c.env.DB.prepare('UPDATE users SET github_id = ?, name = COALESCE(name, ?) WHERE id = ?')
+        .bind(githubId, displayName, byEmail.id)
+        .run();
+      user = await getUserRow(c.env.DB, byEmail.id);
+    } else {
+      if (!signupsAllowed(c)) {
+        throw new HttpError(403, 'Sign-ups are disabled. Ask an administrator to invite you.');
+      }
+      const userId = crypto.randomUUID();
+      await c.env.DB.prepare(
+        "INSERT INTO users (id, email, name, auth_provider, github_id) VALUES (?, ?, ?, 'github', ?)"
+      )
+        .bind(userId, email, displayName, githubId)
+        .run();
+      user = await getUserRow(c.env.DB, userId);
+      isNewAccount = true;
+    }
+  }
+
+  if (!user) throw new HttpError(500, 'Failed to load user');
+  return completeLogin(c, user, 'github', isNewAccount);
 });
 
 // ============================================
 // MAGIC LINKS
 // ============================================
 
-/**
- * Request a magic link
- * Has stricter rate limiting to prevent email spam
- */
-authRoutes.post('/magic-link', passwordResetRateLimit, async (c) => {
+const GENERIC_MAGIC_LINK_RESPONSE = { message: 'If this address can sign in, a login link has been sent.' };
+
+authRoutes.post('/magic-link', magicLinkRateLimit, async (c) => {
   const { email } = await validateBody(c, magicLinkRequestSchema);
-  
-  // Configurable expiry (default 15 minutes)
-  const expiryMinutes = parseInt(c.env.MAGIC_LINK_EXPIRY_MINUTES || '15', 10);
-  const expiresAt = new Date(Date.now() + expiryMinutes * 60 * 1000);
-  
-  // Generate token
-  const token = crypto.randomUUID();
-  
-  // Store token
-  await c.env.DB.prepare(
-    'INSERT INTO magic_links (token, email, expires_at) VALUES (?, ?, ?)'
-  )
-    .bind(token, email.toLowerCase(), expiresAt.toISOString())
-    .run();
-  
-  // Configurable email sender (default: noreply@cloudvault.app)
-  const emailFrom = c.env.EMAIL_FROM || 'CloudVault <noreply@cloudvault.app>';
-  
-  // Send email (if Resend API key is configured)
-  if (c.env.RESEND_API_KEY) {
-    const magicLinkUrl = `${c.env.APP_URL}/auth/magic-link?token=${token}`;
 
-    try {
-      const emailResponse = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${c.env.RESEND_API_KEY}`,
-        },
-        body: JSON.stringify({
-          from: emailFrom,
-          to: email,
-          subject: 'Your CloudVault Login Link',
-          html: `
-            <h2>Login to CloudVault</h2>
-            <p>Click the link below to log in. This link expires in ${expiryMinutes} minutes.</p>
-            <a href="${magicLinkUrl}" style="
-              display: inline-block;
-              padding: 12px 24px;
-              background-color: #0ea5e9;
-              color: white;
-              text-decoration: none;
-              border-radius: 6px;
-            ">Log In to CloudVault</a>
-            <p>Or copy this link: ${magicLinkUrl}</p>
-            <p style="color: #666; font-size: 12px;">
-              If you didn't request this login link, you can safely ignore this email.
-            </p>
-          `,
-        }),
-      });
+  // Per-address limit, so one inbox cannot be flooded from many IPs. Excess
+  // requests get the same generic response.
+  const perEmail = await hitCounter(c.env.DB, `rl:magic-email:${await sha256Hex(email)}`, 900);
+  if (perEmail.count > 3) return c.json(GENERIC_MAGIC_LINK_RESPONSE);
 
-      if (!emailResponse.ok) {
-        // Log failure but don't expose to user (security: don't reveal if email exists)
-        console.error('Failed to send magic link email:', emailResponse.status);
-      }
-    } catch (err) {
-      // Log error but continue - don't reveal email delivery status to user
-      console.error('Email service error:', err instanceof Error ? err.message : 'unknown');
-    }
+  if (!signupsAllowed(c)) {
+    const exists = await c.env.DB.prepare('SELECT 1 FROM users WHERE email = ?').bind(email).first();
+    if (!exists) return c.json(GENERIC_MAGIC_LINK_RESPONSE);
   }
-  // Note: In development without Resend, magic link is stored in DB but no email sent
-  // Check magic_links table directly for testing
-  
-  return c.json({ message: 'If an account exists, a login link has been sent.' });
+
+  const expiryMinutes = Math.min(Math.max(parseInt(c.env.MAGIC_LINK_EXPIRY_MINUTES || '15', 10) || 15, 5), 60);
+  const expiresAt = new Date(Date.now() + expiryMinutes * 60_000).toISOString();
+  const token = randomToken(32);
+
+  // Only the hash is stored, so a database leak does not expose live links.
+  await c.env.DB.prepare('INSERT INTO magic_links (token, email, expires_at) VALUES (?, ?, ?)')
+    .bind(await sha256Hex(token), email, expiresAt)
+    .run();
+
+  // The token travels in the URL fragment, which browsers never send to servers.
+  const link = `${new URL(c.env.APP_URL).origin}/auth/magic-link#token=${token}`;
+  const sent = await sendEmail(c.env, {
+    to: email,
+    subject: 'Your CloudVault login link',
+    html: emailLayout(
+      'Log in to CloudVault',
+      `<p>Use the button below to log in. The link expires in ${expiryMinutes} minutes and works once.</p>${emailButton('Log in to CloudVault', link)}`
+    ),
+  });
+
+  if (!sent && c.env.ENVIRONMENT !== 'production') {
+    // Local development without Resend: print the link so it can be used.
+    console.log(`[dev] Magic link for ${email}: ${link}`);
+  }
+
+  return c.json(GENERIC_MAGIC_LINK_RESPONSE);
 });
 
-/**
- * Verify magic link token
- */
 authRoutes.post('/magic-link/verify', async (c) => {
   const { token } = await validateBody(c, magicLinkVerifySchema);
-  
-  // Find and validate token
-  const magicLink = await c.env.DB.prepare(
-    'SELECT * FROM magic_links WHERE token = ? AND used = 0'
+  const tokenHash = await sha256Hex(token);
+
+  // Consume atomically: of two concurrent requests, only one gets a row back.
+  const consumed = await c.env.DB.prepare(
+    'UPDATE magic_links SET used = 1 WHERE token = ? AND used = 0 AND expires_at > ? RETURNING email'
   )
-    .bind(token)
-    .first<{ token: string; email: string; expires_at: string; used: number }>();
-  
-  if (!magicLink) {
-    return c.json({ error: 'Invalid or expired link' }, 400);
-  }
-  
-  if (new Date(magicLink.expires_at) < new Date()) {
-    return c.json({ error: 'Link has expired' }, 400);
-  }
-  
-  // Mark token as used
-  await c.env.DB.prepare('UPDATE magic_links SET used = 1 WHERE token = ?')
-    .bind(token)
-    .run();
-  
-  // Find or create user
-  let existingUser = await c.env.DB.prepare('SELECT * FROM users WHERE email = ?')
-    .bind(magicLink.email)
-    .first<{
-      id: string;
-      email: string;
-      name: string | null;
-      public_key: string | null;
-      encrypted_private_key: string | null;
-      salt: string | null;
-      auth_provider: string;
-    }>();
-  
-  let isNewUser = false;
-  
-  if (!existingUser) {
+    .bind(tokenHash, new Date().toISOString())
+    .first<{ email: string }>();
+
+  if (!consumed) throw new HttpError(400, 'This login link is invalid or has expired');
+
+  let user = await c.env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(consumed.email).first<UserRow>();
+  let isNewAccount = false;
+  if (!user) {
+    if (!signupsAllowed(c)) throw new HttpError(403, 'Sign-ups are disabled');
     const userId = crypto.randomUUID();
-    await c.env.DB.prepare(
-      `INSERT INTO users (id, email, auth_provider) VALUES (?, ?, 'magic_link')`
-    )
-      .bind(userId, magicLink.email)
+    await c.env.DB.prepare("INSERT INTO users (id, email, auth_provider) VALUES (?, ?, 'magic_link')")
+      .bind(userId, consumed.email)
       .run();
-    
-    existingUser = {
-      id: userId,
-      email: magicLink.email,
-      name: null,
-      public_key: null,
-      encrypted_private_key: null,
-      salt: null,
-      auth_provider: 'magic_link',
-    };
-    isNewUser = true;
+    user = await getUserRow(c.env.DB, userId);
+    isNewAccount = true;
   }
-  
-  // Fetch session timeout preference for caching in JWT
-  const prefs = await c.env.DB.prepare(
-    'SELECT session_timeout FROM user_preferences WHERE user_id = ?'
-  )
-    .bind(existingUser.id)
-    .first<{ session_timeout: number }>();
 
-  // Create JWT with cached session timeout
-  const jwtToken = await createToken(
-    { id: existingUser.id, email: existingUser.email, name: existingUser.name },
-    c.env.JWT_SECRET,
-    prefs?.session_timeout
-  );
-  
-  // Log audit event
-  await logAuditEvent(c.env.DB, {
-    userId: existingUser.id,
-    userEmail: existingUser.email,
-    action: 'LOGIN',
-    metadata: { provider: 'magic_link', isNewUser },
-    ipAddress: c.req.header('CF-Connecting-IP') || undefined,
-    userAgent: c.req.header('User-Agent') || undefined,
-  });
-  
-  return c.json({
-    token: jwtToken,
-    user: {
-      id: existingUser.id,
-      email: existingUser.email,
-      name: existingUser.name,
-      publicKey: existingUser.public_key,
-      encryptedPrivateKey: existingUser.encrypted_private_key,
-      salt: existingUser.salt,
-      authProvider: existingUser.auth_provider,
-      createdAt: new Date().toISOString(),
-    },
-    isNewUser: isNewUser || !existingUser.public_key,
-  });
+  if (!user) throw new HttpError(500, 'Failed to load user');
+  return completeLogin(c, user, 'magic_link', isNewAccount);
 });
 
 // ============================================
-// USER SESSION
+// CURRENT USER
 // ============================================
 
-/**
- * Get current user
- */
 authRoutes.get('/me', authMiddleware, async (c) => {
-  const user = c.get('user')!;
-  
-  const dbUser = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?')
-    .bind(user.id)
-    .first<{
-      id: string;
-      email: string;
-      name: string | null;
-      public_key: string | null;
-      encrypted_private_key: string | null;
-      salt: string | null;
-      auth_provider: string;
-      created_at: string;
-    }>();
-  
-  if (!dbUser) {
-    return c.json({ error: 'User not found' }, 404);
-  }
-  
-  return c.json({
-    id: dbUser.id,
-    email: dbUser.email,
-    name: dbUser.name,
-    publicKey: dbUser.public_key,
-    encryptedPrivateKey: dbUser.encrypted_private_key,
-    salt: dbUser.salt,
-    authProvider: dbUser.auth_provider,
-    createdAt: dbUser.created_at,
-  });
+  const user = await getUserRow(c.env.DB, getUser(c).id);
+  if (!user) throw new HttpError(404, 'User not found');
+  return c.json(serializeUser(user));
+});
+
+authRoutes.patch('/me', authMiddleware, async (c) => {
+  const { id } = getUser(c);
+  const { name } = await validateBody(c, updateProfileSchema);
+  await c.env.DB.prepare('UPDATE users SET name = ? WHERE id = ?').bind(name, id).run();
+  createAuditLogger(c).log('UPDATE_PROFILE', { targetType: 'user', targetId: id });
+  const user = await getUserRow(c.env.DB, id);
+  if (!user) throw new HttpError(404, 'User not found');
+  return c.json(serializeUser(user));
+});
+
+/** First-time key setup after the user picks a master password. */
+authRoutes.post('/setup-keys', authMiddleware, async (c) => {
+  const { id } = getUser(c);
+  const data = await validateBody(c, setupKeysSchema);
+
+  // Only succeeds if no key is set yet, even under concurrent requests.
+  const result = await c.env.DB.prepare(
+    'UPDATE users SET public_key = ?, encrypted_private_key = ?, salt = ?, kdf_iterations = ? WHERE id = ? AND public_key IS NULL'
+  )
+    .bind(data.publicKey, data.encryptedPrivateKey, data.salt, data.kdfIterations, id)
+    .run();
+
+  if (!result.meta?.changes) throw new HttpError(409, 'Keys are already set up');
+
+  createAuditLogger(c).log('SETUP_KEYS', { targetType: 'user', targetId: id });
+  const user = await getUserRow(c.env.DB, id);
+  if (!user) throw new HttpError(404, 'User not found');
+  return c.json(serializeUser(user));
 });
 
 /**
- * Setup user keys (first-time setup after login)
+ * Change master password: the client re-encrypts the same private key under a
+ * new password. The public key does not change, so org access is unaffected.
+ * Every other session is signed out.
  */
-authRoutes.post('/setup-keys', authMiddleware, async (c) => {
-  const user = c.get('user')!;
-  const { publicKey, encryptedPrivateKey, salt } = await validateBody(c, setupKeysSchema);
-  
-  // Check if user already has keys
-  const existingUser = await c.env.DB.prepare(
-    'SELECT public_key FROM users WHERE id = ?'
+authRoutes.put('/keys', authMiddleware, async (c) => {
+  const { id } = getUser(c);
+  const session = getSession(c);
+  const data = await validateBody(c, changeMasterPasswordSchema);
+
+  const result = await c.env.DB.prepare(
+    'UPDATE users SET encrypted_private_key = ?, salt = ?, kdf_iterations = ? WHERE id = ? AND public_key IS NOT NULL'
   )
-    .bind(user.id)
-    .first<{ public_key: string | null }>();
-  
-  if (existingUser?.public_key) {
-    return c.json({ error: 'Keys already set up' }, 400);
-  }
-  
-  // Update user with keys
-  await c.env.DB.prepare(
-    'UPDATE users SET public_key = ?, encrypted_private_key = ?, salt = ? WHERE id = ?'
-  )
-    .bind(publicKey, encryptedPrivateKey, salt, user.id)
+    .bind(data.encryptedPrivateKey, data.salt, data.kdfIterations, id)
     .run();
-  
-  // Get updated user
-  const updatedUser = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?')
-    .bind(user.id)
-    .first<{
-      id: string;
-      email: string;
-      name: string | null;
-      public_key: string;
-      encrypted_private_key: string;
-      salt: string;
-      auth_provider: string;
-      created_at: string;
-    }>();
-  
-  return c.json({
-    id: updatedUser!.id,
-    email: updatedUser!.email,
-    name: updatedUser!.name,
-    publicKey: updatedUser!.public_key,
-    encryptedPrivateKey: updatedUser!.encrypted_private_key,
-    salt: updatedUser!.salt,
-    authProvider: updatedUser!.auth_provider,
-    createdAt: updatedUser!.created_at,
+  if (!result.meta?.changes) throw new HttpError(409, 'Keys have not been set up yet');
+
+  const revoked = await revokeAllSessions(c.env.DB, id, session.id);
+  createAuditLogger(c).log('CHANGE_MASTER_PASSWORD', {
+    targetType: 'user',
+    targetId: id,
+    metadata: { kdfIterations: data.kdfIterations, sessionsRevoked: revoked },
   });
+
+  const user = await getUserRow(c.env.DB, id);
+  if (!user) throw new HttpError(404, 'User not found');
+  return c.json(serializeUser(user));
 });
 
 // ============================================
 // LOGOUT
 // ============================================
 
-/**
- * Logout endpoint
- *
- * Blacklists the current JWT token and logs the action.
- * The token is added to a KV-based blacklist with TTL matching
- * the token's remaining lifetime.
- *
- * @route POST /api/auth/logout
- */
 authRoutes.post('/logout', authMiddleware, async (c) => {
-  const user = c.get('user')!;
-  const jwtPayload = getJwtPayload(c);
+  await revokeSession(c.env.DB, getSession(c).id);
+  createAuditLogger(c).log('LOGOUT');
+  return c.json({ success: true });
+});
 
-  // Blacklist the token if it has a JTI
-  if (jwtPayload?.jti && jwtPayload?.exp) {
-    await blacklistToken(c.env.KV, jwtPayload.jti, jwtPayload.exp);
-  }
+authRoutes.post('/logout-all', authMiddleware, async (c) => {
+  const user = getUser(c);
+  const count = await revokeAllSessions(c.env.DB, user.id);
+  createAuditLogger(c).log('LOGOUT_ALL', { metadata: { sessionsRevoked: count } });
+  return c.json({ success: true, sessionsRevoked: count });
+});
 
-  // Log the logout action
-  await logAuditEvent(c.env.DB, {
-    userId: user.id,
-    userEmail: user.email,
-    action: 'LOGOUT',
-    ipAddress: c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For'),
-    userAgent: c.req.header('User-Agent'),
-  });
-
-  return c.json({ success: true, message: 'Logged out successfully' });
+/** Absolute session expiry, for the client to schedule re-login prompts. */
+authRoutes.get('/session', authMiddleware, (c) => {
+  const session = getSession(c);
+  return c.json({ expiresAt: session.expiresAt, now: nowSeconds() });
 });

@@ -1,430 +1,397 @@
 /**
- * Secret Form Component
- *
- * Create and edit secrets/passwords with full dark mode support.
- *
- * @module components/vault/SecretForm
+ * Create or edit an item. Every field except name, website, username hint,
+ * category, tags and expiry is encrypted in the browser.
  */
 
-import { useState, useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useVault } from '../../hooks/useVault';
+import { ApiError, categoriesApi, orgSettingsApi, type Category, type OrgSettings, type SecretType } from '../../lib/api';
+import type { CustomField, SecretPayload } from '../../lib/crypto';
+import { assessPassword } from '../../lib/passwords';
+import { parseTotp } from '../../lib/totp';
+import { useToast } from '../ui/Toast';
+import { Alert, Button, Card, Checkbox, Field, PageHeader, Select, Spinner, TextArea, TextInput, errorMessage } from '../ui/kit';
+import PasswordGenerator from './PasswordGenerator';
+import { SECRET_TYPE_LABELS } from './SecretList';
 
-// Password strength thresholds
-const PASSWORD_LENGTH_MIN = 8;
-const PASSWORD_LENGTH_GOOD = 12;
-const PASSWORD_LENGTH_STRONG = 16;
-const UNIQUE_CHAR_RATIO = 0.7;
+interface FormState {
+  secretType: SecretType;
+  name: string;
+  url: string;
+  username: string;
+  password: string;
+  apiKey: string;
+  totp: string;
+  notes: string;
+  cardHolder: string;
+  cardNumber: string;
+  cardExpiry: string;
+  cardCvv: string;
+  cardPin: string;
+  customFields: CustomField[];
+  categoryId: string;
+  tags: string;
+  expiresAt: string; // yyyy-mm-dd or ''
+}
 
-/**
- * Calculate password strength score and feedback
- */
-function calculatePasswordStrength(password: string): {
-  score: number;
-  label: string;
-  color: string;
-  feedback: string[];
-} {
-  if (!password) {
-    return { score: 0, label: 'None', color: 'gray', feedback: [] };
-  }
+const EMPTY: FormState = {
+  secretType: 'password',
+  name: '',
+  url: '',
+  username: '',
+  password: '',
+  apiKey: '',
+  totp: '',
+  notes: '',
+  cardHolder: '',
+  cardNumber: '',
+  cardExpiry: '',
+  cardCvv: '',
+  cardPin: '',
+  customFields: [],
+  categoryId: '',
+  tags: '',
+  expiresAt: '',
+};
 
-  let score = 0;
-  const feedback: string[] = [];
+const opt = (v: string) => (v.trim() ? v : undefined);
 
-  // Length checks
-  if (password.length >= PASSWORD_LENGTH_MIN) score += 1;
-  if (password.length >= PASSWORD_LENGTH_GOOD) score += 1;
-  if (password.length >= PASSWORD_LENGTH_STRONG) score += 1;
-  if (password.length < PASSWORD_LENGTH_MIN) feedback.push(`Use at least ${PASSWORD_LENGTH_MIN} characters`);
-
-  // Character type checks
-  if (/[a-z]/.test(password)) score += 1;
-  else feedback.push('Add lowercase letters');
-  
-  if (/[A-Z]/.test(password)) score += 1;
-  else feedback.push('Add uppercase letters');
-  
-  if (/[0-9]/.test(password)) score += 1;
-  else feedback.push('Add numbers');
-  
-  if (/[^a-zA-Z0-9]/.test(password)) score += 1;
-  else feedback.push('Add special characters');
-
-  // Bonus for variety
-  const uniqueChars = new Set(password).size;
-  if (uniqueChars >= password.length * UNIQUE_CHAR_RATIO) score += 1;
-
-  // Convert to 0-4 scale
-  const normalizedScore = Math.min(4, Math.floor(score / 2));
-
-  const labels = ['Very Weak', 'Weak', 'Fair', 'Strong', 'Very Strong'];
-  const colors = ['red', 'orange', 'yellow', 'lime', 'green'];
-
+function toPayload(f: FormState): SecretPayload {
+  const card =
+    f.secretType === 'card'
+      ? { holder: opt(f.cardHolder), number: opt(f.cardNumber.replace(/\s+/g, ' ')), expiry: opt(f.cardExpiry), cvv: opt(f.cardCvv), pin: opt(f.cardPin) }
+      : undefined;
+  const custom = f.customFields.filter((c) => c.label.trim());
   return {
-    score: normalizedScore,
-    label: labels[normalizedScore],
-    color: colors[normalizedScore],
-    feedback: feedback.slice(0, 2), // Show max 2 suggestions
+    username: opt(f.username),
+    password: opt(f.password),
+    apiKey: opt(f.apiKey),
+    totp: opt(f.totp),
+    notes: opt(f.notes),
+    card,
+    customFields: custom.length ? custom : undefined,
   };
 }
 
-/**
- * Password strength indicator component
- */
-function PasswordStrengthIndicator({ password }: { password: string }) {
-  const strength = useMemo(() => calculatePasswordStrength(password), [password]);
-  
-  const colorClasses = {
-    gray: 'bg-gray-200 dark:bg-gray-700',
-    red: 'bg-red-500',
-    orange: 'bg-orange-500',
-    yellow: 'bg-yellow-500',
-    lime: 'bg-lime-500',
-    green: 'bg-green-500',
+function fromPayload(p: SecretPayload): Partial<FormState> {
+  return {
+    username: p.username ?? '',
+    password: p.password ?? '',
+    apiKey: p.apiKey ?? '',
+    totp: p.totp ?? '',
+    notes: p.notes ?? '',
+    cardHolder: p.card?.holder ?? '',
+    cardNumber: p.card?.number ?? '',
+    cardExpiry: p.card?.expiry ?? '',
+    cardCvv: p.card?.cvv ?? '',
+    cardPin: p.card?.pin ?? '',
+    customFields: p.customFields ?? [],
   };
-  
-  const textColors = {
-    gray: 'text-gray-500 dark:text-gray-400',
-    red: 'text-red-600 dark:text-red-400',
-    orange: 'text-orange-600 dark:text-orange-400',
-    yellow: 'text-yellow-600 dark:text-yellow-400',
-    lime: 'text-lime-600 dark:text-lime-400',
-    green: 'text-green-600 dark:text-green-400',
-  };
+}
 
-  return (
-    <div className="mt-2" role="status" aria-live="polite">
-      {/* Strength Bar */}
-      <div className="flex gap-1 mb-1">
-        {[0, 1, 2, 3, 4].map((level) => (
-          <div
-            key={level}
-            className={`h-1 flex-1 rounded-full transition-colors ${
-              level <= strength.score
-                ? colorClasses[strength.color as keyof typeof colorClasses]
-                : 'bg-gray-200 dark:bg-gray-700'
-            }`}
-          />
-        ))}
-      </div>
-      
-      {/* Strength Label and Feedback */}
-      <div className="flex items-center justify-between text-xs">
-        <span className={textColors[strength.color as keyof typeof textColors]}>
-          {strength.label}
-        </span>
-        {strength.feedback.length > 0 && (
-          <span className="text-gray-500 dark:text-gray-400">
-            {strength.feedback[0]}
-          </span>
-        )}
-      </div>
-    </div>
-  );
+/** Normalized URL: add https:// when the scheme is missing. */
+function normalizeUrl(value: string): string {
+  const v = value.trim();
+  if (!v) return '';
+  return /^[a-z][a-z0-9+.-]*:/i.test(v) ? v : `https://${v}`;
+}
+
+function dateInputValue(iso: string | null): string {
+  return iso ? iso.slice(0, 10) : '';
 }
 
 export default function SecretForm() {
   const { id } = useParams<{ id?: string }>();
-  const navigate = useNavigate();
-  const { secrets, currentOrg, createSecret, updateSecret, decryptSecretData } = useVault();
-  
   const isEditing = !!id;
-  const existingSecret = isEditing ? secrets.find((s) => s.id === id) : null;
+  const navigate = useNavigate();
+  const toast = useToast();
+  const { currentOrg, openSecret, createSecret, updateSecret } = useVault();
 
-  const [formData, setFormData] = useState({
-    name: '',
-    url: '',
-    usernameHint: '',
-    username: '',
-    password: '',
-    notes: '',
-  });
-  const [isLoading, setIsLoading] = useState(isEditing);
-  const [isSaving, setIsSaving] = useState(false);
+  const [form, setForm] = useState<FormState>(EMPTY);
+  const [original, setOriginal] = useState<{ payload: string; version: number } | null>(null);
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [settings, setSettings] = useState<OrgSettings | null>(null);
+  const [loading, setLoading] = useState(isEditing);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showGenerator, setShowGenerator] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
 
-  // Load existing secret data for editing
   useEffect(() => {
-    if (isEditing && existingSecret) {
-      decryptSecretData(existingSecret)
-        .then((data) => {
-          setFormData({
-            name: existingSecret.name,
-            url: existingSecret.url || '',
-            usernameHint: existingSecret.usernameHint || '',
-            username: data.username,
-            password: data.password,
-            notes: data.notes || '',
-          });
-          setIsLoading(false);
-        })
-        .catch((err) => {
-          setError(err.message || 'Failed to load secret');
-          setIsLoading(false);
-        });
-    }
-  }, [isEditing, existingSecret, decryptSecretData]);
+    if (!currentOrg) return;
+    categoriesApi.list(currentOrg.id).then(setCategories).catch(() => undefined);
+    orgSettingsApi
+      .get(currentOrg.id)
+      .then((s) => {
+        setSettings(s);
+        if (!isEditing && s.passwordExpiryDays > 0) {
+          const d = new Date(Date.now() + s.passwordExpiryDays * 86_400_000);
+          setForm((f) => (f.expiresAt ? f : { ...f, expiresAt: d.toISOString().slice(0, 10) }));
+        }
+      })
+      .catch(() => undefined);
+  }, [currentOrg, isEditing]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  useEffect(() => {
+    if (!id) return;
+    openSecret(id)
+      .then(({ secret, payload }) => {
+        setForm({
+          ...EMPTY,
+          ...fromPayload(payload),
+          secretType: secret.secretType,
+          name: secret.name,
+          url: secret.url ?? '',
+          categoryId: secret.categoryId ?? '',
+          tags: secret.tags.join(', '),
+          expiresAt: dateInputValue(secret.expiresAt),
+        });
+        setOriginal({ payload: JSON.stringify(payload), version: secret.version });
+      })
+      .catch((err) => setError(errorMessage(err, 'Could not load this item')))
+      .finally(() => setLoading(false));
+  }, [id, openSecret]);
+
+  const set = <K extends keyof FormState>(key: K, value: FormState[K]) => setForm((f) => ({ ...f, [key]: value }));
+  const strength = useMemo(() => assessPassword(form.password), [form.password]);
+  const minLength = settings?.minPasswordLength ?? 12;
+  const totpInvalid = form.totp.trim() !== '' && !parseTotp(form.totp);
+  const t = form.secretType;
+
+  const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    if (totpInvalid) {
+      setError('The 2FA secret is not a valid base32 secret or otpauth:// link');
+      return;
+    }
+    setSaving(true);
     setError(null);
-    
-    if (!formData.name.trim()) {
-      setError('Name is required');
-      return;
-    }
-    
-    if (!formData.username.trim()) {
-      setError('Username is required');
-      return;
-    }
-    
-    if (!formData.password) {
-      setError('Password is required');
-      return;
-    }
-    
-    setIsSaving(true);
-    
+
+    const payload = toPayload(form);
+    const tags = [...new Set(form.tags.split(',').map((s) => s.trim()).filter(Boolean))].slice(0, 20);
+    const input = {
+      name: form.name.trim(),
+      url: normalizeUrl(form.url),
+      usernameHint: form.username.trim().slice(0, 200),
+      categoryId: form.categoryId || null,
+      secretType: form.secretType,
+      tags,
+      expiresAt: form.expiresAt ? new Date(`${form.expiresAt}T23:59:59Z`).toISOString() : null,
+    };
+
     try {
-      if (isEditing && id) {
-        await updateSecret(id, {
-          name: formData.name,
-          url: formData.url || undefined,
-          usernameHint: formData.usernameHint || undefined,
-          username: formData.username,
-          password: formData.password,
-          notes: formData.notes || undefined,
-        });
+      if (isEditing && id && original) {
+        const changed = JSON.stringify(payload) !== original.payload;
+        await updateSecret(id, input, changed ? payload : undefined, original.version);
+        toast.success('Saved');
+        navigate(`/?secret=${id}`);
       } else {
-        await createSecret({
-          name: formData.name,
-          url: formData.url || undefined,
-          usernameHint: formData.usernameHint || undefined,
-          username: formData.username,
-          password: formData.password,
-          notes: formData.notes || undefined,
-        });
+        const created = await createSecret(input, payload);
+        toast.success('Item created');
+        navigate(`/?secret=${created.id}`);
       }
-      
-      navigate('/');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save secret');
+      if (err instanceof ApiError && err.code === 'VERSION_CONFLICT') {
+        setError('Someone else changed this item while you were editing. Copy your changes, reload the page and try again.');
+      } else {
+        setError(errorMessage(err, 'Could not save'));
+      }
     } finally {
-      setIsSaving(false);
+      setSaving(false);
     }
   };
 
-  const generatePassword = () => {
-    const length = 20;
-    const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:,.<>?';
-    const randomValues = new Uint32Array(length);
-    crypto.getRandomValues(randomValues);
-    const password = Array.from(randomValues)
-      .map((val) => charset[val % charset.length])
-      .join('');
-    setFormData((prev) => ({ ...prev, password }));
-    setShowPassword(true);
-  };
-
-  if (!currentOrg) {
+  if (currentOrg?.role === 'read_only') return <Alert tone="warning">You have read-only access to {currentOrg.name}.</Alert>;
+  if (loading) {
     return (
-      <div className="text-center py-12">
-        <p className="text-gray-500 dark:text-gray-400">Please select an organization first.</p>
-      </div>
-    );
-  }
-
-  if (isLoading) {
-    return (
-      <div className="max-w-2xl mx-auto py-12 text-center">
-        <svg
-          className="animate-spin mx-auto h-8 w-8 text-vault-600"
-          fill="none"
-          viewBox="0 0 24 24"
-          aria-hidden="true"
-        >
-          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-        </svg>
-        <p className="mt-2 text-gray-500 dark:text-gray-400">Loading...</p>
+      <div className="flex justify-center py-16 text-vault-600">
+        <Spinner className="h-8 w-8" />
       </div>
     );
   }
 
   return (
-    <div className="max-w-2xl mx-auto">
-      <div className="mb-6">
-        <button
-          onClick={() => navigate('/')}
-          className="inline-flex items-center text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
-          aria-label="Go back to passwords list"
-        >
-          <svg className="w-4 h-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-          </svg>
-          Back to passwords
-        </button>
-      </div>
+    <div className="mx-auto max-w-2xl">
+      <PageHeader title={isEditing ? 'Edit item' : 'New item'} description="Everything except the name, website, username, category, tags and expiry date is encrypted on this device." />
+      <form onSubmit={handleSubmit} className="space-y-6">
+        {error && <Alert tone="error">{error}</Alert>}
 
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-6">
-        <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100 mb-6">
-          {isEditing ? 'Edit Password' : 'Add New Password'}
-        </h1>
-
-        {error && (
-          <div className="mb-6 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 px-4 py-3 rounded-lg text-sm" role="alert">
-            {error}
-          </div>
-        )}
-
-        <form onSubmit={handleSubmit} className="space-y-6">
-          {/* Name */}
-          <div>
-            <label htmlFor="name" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Name <span className="text-red-500">*</span>
-            </label>
-            <input
-              id="name"
-              type="text"
-              value={formData.name}
-              onChange={(e) => setFormData((prev) => ({ ...prev, name: e.target.value }))}
-              placeholder="e.g., Company Bank Account"
-              className="w-full px-4 py-3 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-vault-500 focus:border-vault-500"
-              autoFocus
-              required
-              aria-required="true"
-            />
-          </div>
-
-          {/* URL */}
-          <div>
-            <label htmlFor="url" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Website URL
-            </label>
-            <input
-              id="url"
-              type="text"
-              value={formData.url}
-              onChange={(e) => setFormData((prev) => ({ ...prev, url: e.target.value }))}
-              placeholder="e.g., chase.com"
-              className="w-full px-4 py-3 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-vault-500 focus:border-vault-500"
-            />
-          </div>
-
-          {/* Username */}
-          <div>
-            <label htmlFor="username" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Username / Email <span className="text-red-500">*</span>
-            </label>
-            <input
-              id="username"
-              type="text"
-              value={formData.username}
-              onChange={(e) => {
-                setFormData((prev) => ({
-                  ...prev,
-                  username: e.target.value,
-                  usernameHint: e.target.value,
-                }));
-              }}
-              placeholder="e.g., treasurer@nonprofit.org"
-              className="w-full px-4 py-3 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-vault-500 focus:border-vault-500"
-              required
-              aria-required="true"
-            />
-            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-              This will be shown in the list for easy identification
-            </p>
-          </div>
-
-          {/* Password */}
-          <div>
-            <label htmlFor="password" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Password <span className="text-red-500">*</span>
-            </label>
-            <div className="flex space-x-2">
-              <div className="relative flex-1">
-                <input
-                  id="password"
-                  type={showPassword ? 'text' : 'password'}
-                  value={formData.password}
-                  onChange={(e) => setFormData((prev) => ({ ...prev, password: e.target.value }))}
-                  placeholder="Enter password"
-                  className="w-full px-4 py-3 pr-10 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-vault-500 focus:border-vault-500 font-mono"
-                  required
-                  aria-required="true"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300"
-                  aria-label={showPassword ? 'Hide password' : 'Show password'}
-                >
-                  {showPassword ? (
-                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
-                    </svg>
-                  ) : (
-                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                    </svg>
-                  )}
-                </button>
+        <Card>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Type">
+              {(fid) => (
+                <Select id={fid} value={t} onChange={(e) => set('secretType', e.target.value as SecretType)}>
+                  {Object.entries(SECRET_TYPE_LABELS).map(([value, label]) => (
+                    <option key={value} value={value}>
+                      {label}
+                    </option>
+                  ))}
+                </Select>
+              )}
+            </Field>
+            <Field label="Name">
+              {(fid) => <TextInput id={fid} required maxLength={200} value={form.name} onChange={(e) => set('name', e.target.value)} placeholder="e.g. Bank of the West" />}
+            </Field>
+            {(t === 'password' || t === 'api_key' || t === 'totp') && (
+              <div className="sm:col-span-2">
+                <Field label="Website">
+                  {(fid) => <TextInput id={fid} inputMode="url" value={form.url} onChange={(e) => set('url', e.target.value)} placeholder="https://example.com" />}
+                </Field>
               </div>
-              <button
-                type="button"
-                onClick={generatePassword}
-                className="px-4 py-3 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600 whitespace-nowrap"
-                aria-label="Generate secure password"
-              >
-                Generate
-              </button>
-            </div>
-            
-            {/* Password Strength Indicator */}
-            {formData.password && (
-              <PasswordStrengthIndicator password={formData.password} />
             )}
           </div>
+        </Card>
 
-          {/* Notes */}
-          <div>
-            <label htmlFor="notes" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-              Notes
-            </label>
-            <textarea
-              id="notes"
-              value={formData.notes}
-              onChange={(e) => setFormData((prev) => ({ ...prev, notes: e.target.value }))}
-              placeholder="Security questions, recovery codes, etc."
-              rows={4}
-              className="w-full px-4 py-3 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-vault-500 focus:border-vault-500"
-            />
-          </div>
+        <Card title="Details">
+          <div className="space-y-4">
+            {(t === 'password' || t === 'totp' || t === 'api_key') && (
+              <Field label="Username or email" hint="Shown in the list (stored unencrypted so you can search it).">
+                {(fid) => <TextInput id={fid} autoComplete="off" value={form.username} onChange={(e) => set('username', e.target.value)} />}
+              </Field>
+            )}
 
-          {/* Actions */}
-          <div className="flex justify-end space-x-3 pt-4 border-t border-gray-100 dark:border-gray-700">
-            <button
-              type="button"
-              onClick={() => navigate('/')}
-              className="px-6 py-3 border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={isSaving}
-              className="px-6 py-3 bg-vault-600 text-white rounded-lg hover:bg-vault-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-vault-500 dark:focus:ring-offset-gray-800 disabled:opacity-50"
-            >
-              {isSaving ? 'Saving...' : isEditing ? 'Save Changes' : 'Add Password'}
-            </button>
+            {t === 'password' && (
+              <Field label="Password">
+                {(fid) => (
+                  <>
+                    <div className="flex gap-2">
+                      <TextInput
+                        id={fid}
+                        type={showPassword ? 'text' : 'password'}
+                        autoComplete="new-password"
+                        className="font-mono"
+                        value={form.password}
+                        onChange={(e) => set('password', e.target.value)}
+                      />
+                      <Button variant="secondary" onClick={() => setShowPassword((s) => !s)}>
+                        {showPassword ? 'Hide' : 'Show'}
+                      </Button>
+                      <Button variant="secondary" onClick={() => setShowGenerator(true)}>
+                        Generate
+                      </Button>
+                    </div>
+                    {form.password && (
+                      <div className="mt-2">
+                        <div className="flex gap-1">
+                          {[0, 1, 2, 3].map((i) => (
+                            <div key={i} className={`h-1 flex-1 rounded-full ${i < strength.score ? strength.barClass : 'bg-gray-200 dark:bg-gray-700'}`} />
+                          ))}
+                        </div>
+                        <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                          {strength.label}
+                          {strength.feedback ? `. ${strength.feedback}` : ''}
+                          {form.password.length < minLength ? `. Your organization asks for at least ${minLength} characters.` : ''}
+                        </p>
+                      </div>
+                    )}
+                  </>
+                )}
+              </Field>
+            )}
+
+            {t === 'api_key' && (
+              <Field label="API key or token">
+                {(fid) => <TextArea id={fid} rows={3} className="font-mono" value={form.apiKey} onChange={(e) => set('apiKey', e.target.value)} />}
+              </Field>
+            )}
+
+            {t === 'card' && (
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="Cardholder name">{(fid) => <TextInput id={fid} value={form.cardHolder} onChange={(e) => set('cardHolder', e.target.value)} />}</Field>
+                <Field label="Card number">
+                  {(fid) => <TextInput id={fid} inputMode="numeric" autoComplete="off" className="font-mono" value={form.cardNumber} onChange={(e) => set('cardNumber', e.target.value)} />}
+                </Field>
+                <Field label="Expiry (MM/YY)">{(fid) => <TextInput id={fid} value={form.cardExpiry} onChange={(e) => set('cardExpiry', e.target.value)} />}</Field>
+                <Field label="Security code">
+                  {(fid) => <TextInput id={fid} type="password" autoComplete="off" value={form.cardCvv} onChange={(e) => set('cardCvv', e.target.value)} />}
+                </Field>
+                <Field label="PIN">{(fid) => <TextInput id={fid} type="password" autoComplete="off" value={form.cardPin} onChange={(e) => set('cardPin', e.target.value)} />}</Field>
+              </div>
+            )}
+
+            {(t === 'password' || t === 'totp') && (
+              <Field
+                label="2FA secret (optional for logins)"
+                hint="The setup key or otpauth:// link from the site's two-factor setup page. CloudVault will show the current code."
+                error={totpInvalid ? 'Not a valid base32 secret or otpauth:// link' : null}
+              >
+                {(fid) => <TextInput id={fid} autoComplete="off" className="font-mono" value={form.totp} onChange={(e) => set('totp', e.target.value)} />}
+              </Field>
+            )}
+
+            <Field label="Notes">{(fid) => <TextArea id={fid} rows={t === 'note' ? 10 : 3} value={form.notes} onChange={(e) => set('notes', e.target.value)} />}</Field>
+
+            <div>
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-sm font-medium text-gray-700 dark:text-gray-300">Custom fields</span>
+                <Button variant="ghost" size="sm" onClick={() => set('customFields', [...form.customFields, { label: '', value: '', hidden: false }])}>
+                  Add field
+                </Button>
+              </div>
+              {form.customFields.map((cf, i) => (
+                <div key={i} className="mb-2 grid grid-cols-[1fr_1fr_auto_auto] items-center gap-2">
+                  <TextInput
+                    aria-label={`Field ${i + 1} name`}
+                    placeholder="Name"
+                    value={cf.label}
+                    onChange={(e) => set('customFields', form.customFields.map((c, j) => (j === i ? { ...c, label: e.target.value } : c)))}
+                  />
+                  <TextInput
+                    aria-label={`Field ${i + 1} value`}
+                    placeholder="Value"
+                    type={cf.hidden ? 'password' : 'text'}
+                    value={cf.value}
+                    onChange={(e) => set('customFields', form.customFields.map((c, j) => (j === i ? { ...c, value: e.target.value } : c)))}
+                  />
+                  <Checkbox
+                    label="Hidden"
+                    checked={cf.hidden}
+                    onChange={(e) => set('customFields', form.customFields.map((c, j) => (j === i ? { ...c, hidden: e.target.checked } : c)))}
+                  />
+                  <Button variant="ghost" size="sm" aria-label={`Remove field ${i + 1}`} onClick={() => set('customFields', form.customFields.filter((_, j) => j !== i))}>
+                    Remove
+                  </Button>
+                </div>
+              ))}
+            </div>
           </div>
-        </form>
-      </div>
+        </Card>
+
+        <Card title="Organize">
+          <div className="grid gap-4 sm:grid-cols-3">
+            <Field label="Category">
+              {(fid) => (
+                <Select id={fid} value={form.categoryId} onChange={(e) => set('categoryId', e.target.value)}>
+                  <option value="">None</option>
+                  {categories.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </Select>
+              )}
+            </Field>
+            <Field label="Tags" hint="Comma separated">
+              {(fid) => <TextInput id={fid} value={form.tags} onChange={(e) => set('tags', e.target.value)} />}
+            </Field>
+            <Field label="Expires on" hint="You will be reminded on the Health page">
+              {(fid) => <TextInput id={fid} type="date" value={form.expiresAt} onChange={(e) => set('expiresAt', e.target.value)} />}
+            </Field>
+          </div>
+        </Card>
+
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={() => navigate(-1)}>
+            Cancel
+          </Button>
+          <Button type="submit" loading={saving} disabled={!form.name.trim()}>
+            {isEditing ? 'Save changes' : 'Create item'}
+          </Button>
+        </div>
+      </form>
+
+      {showGenerator && <PasswordGenerator minLength={Math.min(minLength, 64)} onClose={() => setShowGenerator(false)} onSelect={(p) => set('password', p)} />}
     </div>
   );
 }

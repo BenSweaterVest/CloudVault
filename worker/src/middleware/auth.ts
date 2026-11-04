@@ -1,245 +1,165 @@
 /**
- * Authentication Middleware
+ * Authentication and session management.
  *
- * Validates JWT tokens, checks blacklist, enforces session timeout,
- * and attaches user info to context.
+ * Tokens are HS256 JWTs whose `jti` is the id of a row in the `sessions`
+ * table. The row is the source of truth for:
+ *   - revocation (logout, "sign out everywhere")
+ *   - idle timeout (server-enforced, per the user's preference)
+ *   - absolute expiry
+ *
+ * Free tier budget: one D1 read per authenticated request, plus at most one
+ * write per session per minute to record activity.
  */
 
-import { Context, Next } from 'hono';
+import type { Next } from 'hono';
 import * as jose from 'jose';
-import type { Env, Variables } from '../index';
+import type { AppContext, AuthUser } from '../env';
+import { getClientIp, HttpError, nowSeconds } from '../lib/http';
 
-/** Default session timeout in minutes if no preference is set */
-const DEFAULT_SESSION_TIMEOUT_MINUTES = 15;
+/** Absolute session lifetime. */
+export const SESSION_LIFETIME_SECONDS = 7 * 24 * 60 * 60;
+/** Default idle timeout when the user has no preference row. */
+export const DEFAULT_SESSION_TIMEOUT_MINUTES = 15;
+/** Only write last_activity_at when it is at least this stale. */
+const ACTIVITY_WRITE_INTERVAL_SECONDS = 60;
 
-export interface JWTPayload {
-  sub: string;  // user id
-  email: string;
-  name: string | null;
-  iat: number;
+interface TokenClaims {
+  sub: string;
+  jti: string;
   exp: number;
-  jti?: string; // JWT ID for blacklist tracking
-  sessionTimeout?: number; // Session timeout in minutes (cached from user preferences)
+}
+
+function secretKey(secret: string): Uint8Array {
+  return new TextEncoder().encode(secret);
 }
 
 /**
- * Generate a unique JWT ID
+ * Create a session row and a signed token for it.
  */
-function generateJti(): string {
-  return crypto.randomUUID();
-}
+export async function createSession(
+  c: AppContext,
+  user: AuthUser
+): Promise<{ token: string; expiresAt: number }> {
+  const prefs = await c.env.DB.prepare(
+    'SELECT session_timeout FROM user_preferences WHERE user_id = ?'
+  )
+    .bind(user.id)
+    .first<{ session_timeout: number }>();
 
-/**
- * Create a JWT token for a user
- */
-export async function createToken(
-  user: { id: string; email: string; name: string | null },
-  secret: string,
-  sessionTimeout?: number
-): Promise<string> {
-  const secretKey = new TextEncoder().encode(secret);
-  const jti = generateJti();
+  const now = nowSeconds();
+  const expiresAt = now + SESSION_LIFETIME_SECONDS;
+  const sessionId = crypto.randomUUID();
+  const timeout = prefs?.session_timeout ?? DEFAULT_SESSION_TIMEOUT_MINUTES;
 
-  const payload: Record<string, unknown> = {
-    sub: user.id,
-    email: user.email,
-    name: user.name,
-    jti,
-  };
+  await c.env.DB.prepare(
+    `INSERT INTO sessions (id, user_id, created_at, expires_at, last_activity_at, timeout_minutes, ip_address, user_agent)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      sessionId,
+      user.id,
+      now,
+      expiresAt,
+      now,
+      timeout,
+      getClientIp(c),
+      c.req.header('User-Agent')?.slice(0, 300) ?? null
+    )
+    .run();
 
-  // Include session timeout in JWT to avoid DB query on every request
-  if (sessionTimeout !== undefined) {
-    payload.sessionTimeout = sessionTimeout;
-  }
-
-  return new jose.SignJWT(payload)
+  const token = await new jose.SignJWT({})
     .setProtectedHeader({ alg: 'HS256' })
-    .setIssuedAt()
-    .setExpirationTime('7d')
-    .sign(secretKey);
+    .setSubject(user.id)
+    .setJti(sessionId)
+    .setIssuedAt(now)
+    .setExpirationTime(expiresAt)
+    .sign(secretKey(c.env.JWT_SECRET));
+
+  return { token, expiresAt };
 }
 
-/**
- * Verify and decode a JWT token
- */
-export async function verifyToken(
-  token: string,
-  secret: string
-): Promise<JWTPayload> {
-  const secretKey = new TextEncoder().encode(secret);
-
-  const { payload } = await jose.jwtVerify(token, secretKey);
-
-  return {
-    sub: payload.sub as string,
-    email: payload.email as string,
-    name: payload.name as string | null,
-    iat: payload.iat as number,
-    exp: payload.exp as number,
-    jti: payload.jti as string | undefined,
-  };
-}
-
-/**
- * Check if a token is blacklisted
- */
-async function isTokenBlacklisted(kv: KVNamespace, jti: string): Promise<boolean> {
-  const blacklisted = await kv.get(`blacklist:${jti}`);
-  return blacklisted !== null;
-}
-
-/**
- * Add a token to the blacklist
- * TTL is set to match remaining token lifetime
- */
-export async function blacklistToken(
-  kv: KVNamespace,
-  jti: string,
-  expiresAt: number
-): Promise<void> {
-  const now = Math.floor(Date.now() / 1000);
-  const ttl = Math.max(0, expiresAt - now);
-
-  if (ttl > 0) {
-    await kv.put(`blacklist:${jti}`, '1', { expirationTtl: ttl });
+/** Verify a token's signature and expiry and return its claims. */
+export async function verifyToken(token: string, secret: string): Promise<TokenClaims> {
+  const { payload } = await jose.jwtVerify(token, secretKey(secret), {
+    algorithms: ['HS256'],
+  });
+  if (typeof payload.sub !== 'string' || typeof payload.jti !== 'string' || typeof payload.exp !== 'number') {
+    throw new Error('Malformed token');
   }
+  return { sub: payload.sub, jti: payload.jti, exp: payload.exp };
 }
 
-/**
- * Update last activity timestamp for a user session
- */
-async function updateLastActivity(kv: KVNamespace, userId: string): Promise<void> {
-  const now = Math.floor(Date.now() / 1000);
-  // TTL of 24 hours - activity records auto-expire
-  await kv.put(`activity:${userId}`, now.toString(), { expirationTtl: 86400 });
+/** Revoke a single session. */
+export async function revokeSession(db: D1Database, sessionId: string): Promise<void> {
+  await db.prepare('UPDATE sessions SET revoked = 1 WHERE id = ?').bind(sessionId).run();
 }
 
-/**
- * Check if session has timed out based on user preferences
- * Now uses cached timeout from JWT to avoid DB query on every request
- */
-async function isSessionTimedOut(
-  kv: KVNamespace,
+/** Revoke every session for a user, optionally keeping one. */
+export async function revokeAllSessions(
+  db: D1Database,
   userId: string,
-  cachedTimeoutMinutes?: number
-): Promise<boolean> {
-  // Use cached timeout from JWT, or default if not available
-  const timeoutMinutes = cachedTimeoutMinutes ?? DEFAULT_SESSION_TIMEOUT_MINUTES;
-
-  // If timeout is 0, session never times out
-  if (timeoutMinutes === 0) {
-    return false;
-  }
-
-  // Get last activity
-  const lastActivityStr = await kv.get(`activity:${userId}`);
-  if (!lastActivityStr) {
-    // No activity recorded - session is fresh, not timed out
-    return false;
-  }
-
-  const lastActivity = parseInt(lastActivityStr, 10);
-  const now = Math.floor(Date.now() / 1000);
-  const timeoutSeconds = timeoutMinutes * 60;
-
-  return (now - lastActivity) > timeoutSeconds;
+  exceptSessionId?: string
+): Promise<number> {
+  const result = await db
+    .prepare('UPDATE sessions SET revoked = 1 WHERE user_id = ? AND revoked = 0 AND id != ?')
+    .bind(userId, exceptSessionId ?? '')
+    .run();
+  return result.meta?.changes ?? 0;
 }
 
 /**
- * Auth middleware - requires valid JWT that is not blacklisted and not timed out
+ * Require a valid, unrevoked, non-idle session.
  */
-export async function authMiddleware(
-  c: Context<{ Bindings: Env; Variables: Variables }>,
-  next: Next
-) {
-  const authHeader = c.req.header('Authorization');
-
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return c.json({ error: 'Unauthorized' }, 401);
+export async function authMiddleware(c: AppContext, next: Next) {
+  const header = c.req.header('Authorization');
+  if (!header?.startsWith('Bearer ')) {
+    throw new HttpError(401, 'Unauthorized');
   }
 
-  const token = authHeader.slice(7);
-
+  let claims: TokenClaims;
   try {
-    const payload = await verifyToken(token, c.env.JWT_SECRET);
-
-    // Check if token is blacklisted
-    if (payload.jti) {
-      const blacklisted = await isTokenBlacklisted(c.env.KV, payload.jti);
-      if (blacklisted) {
-        return c.json({ error: 'Token has been revoked' }, 401);
-      }
-    }
-
-    // Check session timeout (using cached value from JWT)
-    const timedOut = await isSessionTimedOut(c.env.KV, payload.sub, payload.sessionTimeout);
-    if (timedOut) {
-      return c.json({ error: 'Session timed out', code: 'SESSION_TIMEOUT' }, 401);
-    }
-
-    // Update last activity timestamp
-    await updateLastActivity(c.env.KV, payload.sub);
-
-    // Store token info for potential logout
-    c.set('user', {
-      id: payload.sub,
-      email: payload.email,
-      name: payload.name,
-    });
-
-    // Store full payload for logout to access jti and exp
-    (c as Context & { jwtPayload?: JWTPayload }).jwtPayload = payload;
-
-    await next();
-  } catch (err) {
-    console.error('JWT verification failed:', err);
-    return c.json({ error: 'Invalid token' }, 401);
+    claims = await verifyToken(header.slice(7), c.env.JWT_SECRET);
+  } catch {
+    throw new HttpError(401, 'Invalid token');
   }
-}
 
-/**
- * Optional auth middleware - attaches user if token present, but doesn't require it
- */
-export async function optionalAuthMiddleware(
-  c: Context<{ Bindings: Env; Variables: Variables }>,
-  next: Next
-) {
-  const authHeader = c.req.header('Authorization');
+  const session = await c.env.DB.prepare(
+    `SELECT s.id, s.expires_at, s.last_activity_at, s.timeout_minutes, s.revoked,
+            u.id AS user_id, u.email, u.name
+     FROM sessions s JOIN users u ON u.id = s.user_id
+     WHERE s.id = ? AND s.user_id = ?`
+  )
+    .bind(claims.jti, claims.sub)
+    .first<{
+      id: string;
+      expires_at: number;
+      last_activity_at: number;
+      timeout_minutes: number;
+      revoked: number;
+      user_id: string;
+      email: string;
+      name: string | null;
+    }>();
 
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7);
+  const now = nowSeconds();
 
-    try {
-      const payload = await verifyToken(token, c.env.JWT_SECRET);
-
-      // Check blacklist for optional auth too
-      if (payload.jti) {
-        const blacklisted = await isTokenBlacklisted(c.env.KV, payload.jti);
-        if (!blacklisted) {
-          c.set('user', {
-            id: payload.sub,
-            email: payload.email,
-            name: payload.name,
-          });
-        }
-      } else {
-        c.set('user', {
-          id: payload.sub,
-          email: payload.email,
-          name: payload.name,
-        });
-      }
-    } catch {
-      // Ignore invalid tokens for optional auth
-    }
+  if (!session || session.revoked || session.expires_at <= now) {
+    throw new HttpError(401, 'Session has ended', 'SESSION_ENDED');
   }
+
+  if (session.timeout_minutes > 0 && now - session.last_activity_at > session.timeout_minutes * 60) {
+    await revokeSession(c.env.DB, session.id);
+    throw new HttpError(401, 'Session timed out', 'SESSION_TIMEOUT');
+  }
+
+  if (now - session.last_activity_at >= ACTIVITY_WRITE_INTERVAL_SECONDS) {
+    await c.env.DB.prepare('UPDATE sessions SET last_activity_at = ? WHERE id = ?')
+      .bind(now, session.id)
+      .run();
+  }
+
+  c.set('user', { id: session.user_id, email: session.email, name: session.name });
+  c.set('session', { id: session.id, expiresAt: session.expires_at });
 
   await next();
-}
-
-/**
- * Get JWT payload from context (for logout)
- */
-export function getJwtPayload(c: Context): JWTPayload | undefined {
-  return (c as Context & { jwtPayload?: JWTPayload }).jwtPayload;
 }

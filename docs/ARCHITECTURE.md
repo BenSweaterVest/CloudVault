@@ -1,399 +1,109 @@
-# CloudVault Architecture
+# Architecture
 
-## System Overview
-
-CloudVault is a serverless password vault built entirely on Cloudflare's platform.
+## Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           User's Browser                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐ │
-│  │   React     │  │  Web Crypto │  │  IndexedDB  │  │ LocalStorage│ │
-│  │   Frontend  │  │     API     │  │  (future)   │  │  (tokens)  │ │
-│  └──────┬──────┘  └──────┬──────┘  └─────────────┘  └────────────┘ │
-│         │                │                                          │
-└─────────┼────────────────┼──────────────────────────────────────────┘
-          │                │
-          │ HTTPS          │ Encryption/
-          │                │ Decryption
-          ▼                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Cloudflare Edge                               │
-│  ┌─────────────────────────────────────────────────────────────────┐│
-│  │                    Cloudflare Pages                              ││
-│  │                 (Static Frontend Hosting)                        ││
-│  └─────────────────────────────────────────────────────────────────┘│
-│  ┌─────────────────────────────────────────────────────────────────┐│
-│  │                    Cloudflare Workers                            ││
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       ││
-│  │  │   Hono   │  │   Auth   │  │ Security │  │  Audit   │       ││
-│  │  │  Router  │  │Middleware│  │ Middleware│  │  Logger  │       ││
-│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘       ││
-│  │       └──────────────┴────────────┴─────────────┘              ││
-│  │                           │                                     ││
-│  │                           ▼                                     ││
-│  │  ┌─────────────────────────────────────────────────────────┐   ││
-│  │  │                    Cloudflare D1                         │   ││
-│  │  │                  (SQLite Database)                       │   ││
-│  │  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────────┐   │   ││
-│  │  │  │  users  │ │  orgs   │ │ secrets │ │ audit_logs  │   │   ││
-│  │  │  └─────────┘ └─────────┘ └─────────┘ └─────────────┘   │   ││
-│  │  └─────────────────────────────────────────────────────────┘   ││
-│  └─────────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────────┘
+┌────────────────────── Browser ──────────────────────┐
+│ React app (Cloudflare Pages)                         │
+│  lib/crypto.ts  Web Crypto: keys, items, sharing     │
+│  hooks/useVault keys in memory only                  │
+│  lib/api.ts     fetch client, session events         │
+└───────────────┬──────────────────────────────────────┘
+                │ HTTPS, JSON, ciphertext only
+┌───────────────▼──────────────────────────────────────┐
+│ Cloudflare Worker (Hono)                              │
+│  security headers → CORS → route groups:              │
+│   /api/auth          public + session routes          │
+│   /api/share         public share links (rate limited)│
+│   /api/organizations authMiddleware → org routers     │
+│   /api/preferences   authMiddleware                   │
+│   /api/emergency     authMiddleware (contacts)        │
+│  scheduled()         daily maintenance (cron)         │
+└───────────────┬──────────────────────────────────────┘
+                │
+┌───────────────▼──────────────────────────────────────┐
+│ Cloudflare D1 (SQLite): all state                     │
+└──────────────────────────────────────────────────────┘
 ```
 
-## Component Details
+D1 is the only storage binding. Earlier versions used KV for sessions and rate limits, but KV's free plan allows only 1,000 writes per day and is eventually consistent, so both moved to D1.
 
-### Frontend (Cloudflare Pages)
+## Frontend
 
-**Technology**: React 18, Vite 5, Tailwind CSS, TypeScript
+| Area | Files |
+|------|-------|
+| Crypto | `lib/crypto.ts` (keys, payloads, sharing), `lib/rotation.ts`, `lib/importers.ts` (CSV and encrypted backups), `lib/totp.ts`, `lib/passwords.ts` |
+| State | `lib/auth.tsx` (session), `lib/preferences.tsx`, `hooks/useVault.tsx` (private key, org keys, current org, item list) |
+| Shell | `components/ui/Layout.tsx` (navigation, auto-lock, shortcuts), `components/vault/VaultGate.tsx` (unlock and first-org screens) |
+| Screens | `components/vault/*`, `components/admin/*`, `components/settings/*`, `components/share/*`, `components/emergency/*` |
+| UI primitives | `components/ui/kit.tsx` |
 
-**Key Modules**:
-- `lib/crypto.ts` - Web Crypto API wrapper for all encryption
-- `lib/api.ts` - API client with typed endpoints
-- `lib/auth.tsx` - Authentication context and hooks
-- `hooks/useVault.tsx` - Vault state management
-- `components/` - React components
+Rules the frontend follows:
 
-**State Management**:
-- React Context for global state (auth, vault)
-- Local state for component-specific data
-- LocalStorage for JWT tokens and preferences
+- Private and org keys live only in React state and refs. A page reload drops them.
+- The item list holds metadata only. Opening an item fetches it (an audited view) and decrypts it.
+- All API calls go through `lib/api.ts`. A 401 with `SESSION_TIMEOUT` or `SESSION_ENDED` returns the user to the login screen.
+- Navigation inside the app uses the router; full page loads would lock the vault.
 
-### Backend (Cloudflare Workers)
-
-**Technology**: Hono framework, TypeScript, Zod
-
-**Route Structure**:
-```
-/api
-├── /auth
-│   ├── GET  /github          → OAuth redirect
-│   ├── POST /github/callback → Token exchange
-│   ├── POST /magic-link      → Request magic link
-│   ├── POST /magic-link/verify → Verify token
-│   ├── GET  /me              → Current user
-│   └── POST /setup-keys      → Initialize keys
-├── /organizations
-│   ├── GET  /                → List orgs
-│   ├── POST /                → Create org
-│   └── /:orgId
-│       ├── /members          → User management
-│       ├── /secrets          → Secret CRUD
-│       ├── /categories       → Category CRUD
-│       └── /audit            → Audit logs
-└── /preferences              → User settings
-```
-
-**Middleware Stack**:
-1. `logger` - Request logging
-2. `securityHeaders` - HTTP security headers
-3. `cors` - Cross-origin restrictions
-4. `authMiddleware` - JWT verification (per-route)
-5. `rateLimit` - Request throttling
-
-### Database (Cloudflare D1)
-
-**Engine**: SQLite (distributed)
-
-**Schema Design**:
+## Worker
 
 ```
-┌───────────────────┐       ┌───────────────────┐
-│      users        │       │   organizations   │
-├───────────────────┤       ├───────────────────┤
-│ id (PK)           │       │ id (PK)           │
-│ email             │       │ name              │
-│ name              │       │ created_at        │
-│ public_key        │       └─────────┬─────────┘
-│ encrypted_priv_key│                 │
-│ salt              │                 │
-│ auth_provider     │                 │
-│ github_id         │                 │
-│ created_at        │                 │
-└─────────┬─────────┘                 │
-          │                           │
-          │         ┌─────────────────┘
-          │         │
-          ▼         ▼
-┌───────────────────────────┐
-│       memberships         │
-├───────────────────────────┤
-│ user_id (PK, FK)          │
-│ org_id (PK, FK)           │
-│ role                      │
-│ encrypted_org_key         │
-│ status                    │
-│ invited_by                │
-│ created_at                │
-└───────────────────────────┘
-          │
-          │ org_id
-          ▼
-┌───────────────────┐       ┌───────────────────┐
-│     secrets       │       │    categories     │
-├───────────────────┤       ├───────────────────┤
-│ id (PK)           │◄──────│ id (PK)           │
-│ org_id (FK)       │       │ org_id (FK)       │
-│ name              │       │ name              │
-│ url               │       │ icon              │
-│ username_hint     │       │ color             │
-│ ciphertext_blob   │       │ sort_order        │
-│ iv                │       │ created_at        │
-│ version           │       └───────────────────┘
-│ category_id (FK)  │
-│ is_favorite       │
-│ secret_type       │
-│ expires_at        │
-│ tags (JSON)       │
-│ created_by (FK)   │
-│ updated_at        │
-└─────────┬─────────┘
-          │
-          │ secret_id
-          ▼
-┌───────────────────┐
-│  secret_history   │
-├───────────────────┤
-│ id (PK)           │
-│ secret_id (FK)    │
-│ version           │
-│ ciphertext_blob   │
-│ iv                │
-│ changed_by (FK)   │
-│ created_at        │
-└───────────────────┘
+src/
+  index.ts              app assembly, error handler, cron export
+  env.ts                Env bindings, context variables
+  middleware/
+    auth.ts             sessions (create, verify, revoke, idle timeout)
+    rateLimit.ts        D1 fixed-window counters; in-memory limiter
+    security.ts         headers, CORS origin policy
+    audit.ts            action list, audit writes (also usable inside batches)
+  lib/
+    access.ts           requireMembership(c, orgId, minRole)
+    validation.ts       Zod schemas, validateBody/validateQuery
+    http.ts             HttpError, getUser, param helpers
+    db.ts               chunkJson for json_each bulk writes
+    email.ts            Resend wrapper, escaping
+    crypto.ts           hashing helpers (no slow KDFs)
+  routes/               one file per area
+  scheduled.ts          maintenance job
 ```
 
-## Data Flow
+Route handlers follow one pattern: read params, `requireMembership` with the minimum role, `validateBody` with a schema, run queries, write an audit entry, return JSON. Errors are thrown as `HttpError` or `ValidationError` and turned into JSON by the global handler. Unknown errors return a generic 500 and are logged.
 
-### Authentication Flow
+### Free plan constraints in code
 
-```
-┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐
-│ Browser │     │ Worker  │     │ GitHub  │     │   D1    │
-└────┬────┘     └────┬────┘     └────┬────┘     └────┬────┘
-     │               │               │               │
-     │ GET /auth/github              │               │
-     │──────────────►│               │               │
-     │               │               │               │
-     │  302 Redirect │               │               │
-     │◄──────────────│               │               │
-     │               │               │               │
-     │ OAuth Flow    │               │               │
-     │──────────────────────────────►│               │
-     │               │               │               │
-     │ Callback with code            │               │
-     │◄──────────────────────────────│               │
-     │               │               │               │
-     │ POST /callback with code      │               │
-     │──────────────►│               │               │
-     │               │ Exchange code │               │
-     │               │──────────────►│               │
-     │               │ Access token  │               │
-     │               │◄──────────────│               │
-     │               │               │               │
-     │               │ Get user info │               │
-     │               │──────────────►│               │
-     │               │ User data     │               │
-     │               │◄──────────────│               │
-     │               │               │               │
-     │               │ Find/create user              │
-     │               │──────────────────────────────►│
-     │               │               │               │
-     │               │ Generate JWT  │               │
-     │               │               │               │
-     │ { token, user }               │               │
-     │◄──────────────│               │               │
-```
+- **10 ms CPU per request:** no PBKDF2 or similar on the server. Share link passwords are stretched in the browser; the server compares SHA-256 hashes.
+- **50 D1 queries per request, 100 bound parameters per query:** bulk operations (import, key rotation) pass rows as one JSON parameter and expand them with `json_each`. Multi-statement changes use `DB.batch()`, which also makes them atomic.
+- **Write budget:** session activity is written at most once a minute per session; D1 rate limiting is used only on public endpoints.
 
-### Secret Encryption Flow
+## Data model
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        Browser                               │
-│                                                              │
-│  1. User enters secret data                                  │
-│     { username: "user", password: "secret123" }              │
-│                                                              │
-│  2. Retrieve encrypted org key from memory/server            │
-│     encrypted_org_key = "base64..."                          │
-│                                                              │
-│  3. Decrypt org key with user's private key                  │
-│     org_key = RSA_DECRYPT(encrypted_org_key, private_key)    │
-│                                                              │
-│  4. Generate random IV                                       │
-│     iv = crypto.getRandomValues(new Uint8Array(12))          │
-│                                                              │
-│  5. Encrypt secret data                                      │
-│     ciphertext = AES_GCM_ENCRYPT(JSON.stringify(data),       │
-│                                  org_key, iv)                │
-│                                                              │
-│  6. Send to server                                           │
-│     POST /secrets { ciphertext: "base64...", iv: "base64..." }│
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                        Server                                │
-│                                                              │
-│  - Receives only ciphertext + IV                             │
-│  - Cannot decrypt (no access to org key)                     │
-│  - Stores encrypted blob in D1                               │
-│  - Logs audit event                                          │
-└─────────────────────────────────────────────────────────────┘
-```
+Defined by `worker/migrations/*.sql`.
 
-### Key Exchange Flow (Adding New User)
+| Table | Purpose |
+|-------|---------|
+| `users` | Email, name, public key, wrapped private key, salt, `kdf_iterations`, GitHub id |
+| `organizations` | Name, `key_version` (incremented by rotation) |
+| `memberships` | (user, org), role, status (`pending`/`active`), the user's encrypted copy of the org key |
+| `secrets` | Metadata (name, url, username hint, type, category, tags, expiry) plus `ciphertext_blob`, `iv`, `enc_version`, `version` |
+| `secret_history` | Previous ciphertext versions (newest 20 kept) |
+| `secret_favorites` | Per-user favorites |
+| `categories` | Per-org categories |
+| `share_links` | Share ciphertext, expiry, view limits, optional password verifier |
+| `emergency_contacts` | Contact user, waiting period, escrowed encrypted org key |
+| `emergency_requests` | Requests and their status (`pending`, `approved`, `denied`, `granted`, `expired`) |
+| `organization_settings` | Policies (min length, default expiry, sharing, emergency, audit retention) |
+| `audit_logs` | Who, what, target, metadata, IP, user agent, time |
+| `sessions` | JWT sessions: expiry, last activity, idle timeout, revoked |
+| `rate_limits` | Fixed-window counters |
+| `magic_links` | SHA-256 of outstanding login tokens |
+| `user_preferences` | Theme, idle timeout, clipboard clearing, compact view |
 
-```
-┌─────────────┐           ┌─────────────┐           ┌─────────────┐
-│   Admin     │           │   Server    │           │  New User   │
-│  Browser    │           │             │           │   Browser   │
-└──────┬──────┘           └──────┬──────┘           └──────┬──────┘
-       │                         │                         │
-       │ 1. Invite user@email    │                         │
-       │────────────────────────►│                         │
-       │                         │                         │
-       │                         │ 2. Create pending       │
-       │                         │    membership           │
-       │                         │                         │
-       │                         │ 3. Send invite email    │
-       │                         │────────────────────────►│
-       │                         │                         │
-       │                         │   4. User registers     │
-       │                         │◄────────────────────────│
-       │                         │                         │
-       │                         │   5. User generates     │
-       │                         │      key pair           │
-       │                         │                         │
-       │                         │   6. Store public key   │
-       │                         │◄────────────────────────│
-       │                         │                         │
-       │ 7. View pending user    │                         │
-       │◄────────────────────────│                         │
-       │                         │                         │
-       │ 8. Approve user:        │                         │
-       │    - Decrypt org key    │                         │
-       │    - Re-encrypt for     │                         │
-       │      user's public key  │                         │
-       │────────────────────────►│                         │
-       │                         │                         │
-       │                         │ 9. Store encrypted      │
-       │                         │    org key for user     │
-       │                         │                         │
-       │                         │ 10. Notify user         │
-       │                         │────────────────────────►│
-       │                         │                         │
-       │                         │     User can now        │
-       │                         │     access secrets      │
-```
+## Daily maintenance
 
-## Security Architecture
+`scheduled.ts` runs once a day (`[triggers] crons` in `wrangler.toml`): deletes expired sessions, rate-limit counters and magic links; clears ciphertext from dead share links; expires emergency requests whose contact was removed; deletes audit rows older than each org's retention.
 
-### Trust Boundaries
+## Deployment shape
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    TRUSTED ZONE (User's Browser)                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  - Master password (user's memory)                       │   │
-│  │  - Derived master key (runtime memory)                   │   │
-│  │  - Decrypted private key (runtime memory)                │   │
-│  │  - Decrypted org keys (runtime memory)                   │   │
-│  │  - Plaintext secrets (runtime memory, DOM)               │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                    ══════════╪══════════  TRUST BOUNDARY
-                              │
-┌─────────────────────────────────────────────────────────────────┐
-│                   UNTRUSTED ZONE (Server/Database)               │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  - Encrypted private keys                                │   │
-│  │  - Encrypted org keys                                    │   │
-│  │  - Encrypted secrets (ciphertext only)                   │   │
-│  │  - Public keys                                           │   │
-│  │  - Salts                                                 │   │
-│  │  - Audit logs                                            │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### What The Server Knows
-
-| Data | Server Has Access |
-|------|-------------------|
-| User emails | Yes |
-| User public keys | Yes |
-| Encrypted private keys | Yes (but can't decrypt) |
-| Secret names | Yes (unencrypted for search) |
-| Secret URLs | Yes (unencrypted for search) |
-| Username hints | Yes (unencrypted for display) |
-| Actual passwords | **No** |
-| Organization keys | **No** |
-| Master passwords | **No** |
-
-## Performance Considerations
-
-### Caching Strategy
-
-- **JWT tokens**: Stored in localStorage, validated on each request
-- **Organization keys**: Cached in memory after first decryption
-- **User preferences**: Cached in React context
-- **Secrets list**: Fetched fresh, not cached (security)
-
-### Database Optimization
-
-- Indexes on frequently queried columns
-- Pagination for large datasets (audit logs)
-- JSON columns for flexible data (tags)
-
-### Frontend Optimization
-
-- Code splitting (vendor chunk)
-- Lazy loading for routes (future)
-- Skeleton loaders for perceived performance
-- Debounced search input
-
-## Scalability
-
-### Current Limits (Free Tier)
-
-| Resource | Limit | Typical Usage |
-|----------|-------|---------------|
-| Worker requests | 100k/day | ~500/day for 20 users |
-| D1 storage | 5GB | ~10MB for small org |
-| D1 reads | 5M/day | ~5k/day |
-| Pages bandwidth | Unlimited | Static assets |
-
-### Future Scaling Options
-
-1. **Cloudflare Pro**: Higher limits, analytics
-2. **D1 replicas**: Read replicas for performance
-3. **KV storage**: Cache frequently accessed data
-4. **Durable Objects**: Real-time collaboration (future)
-
-## Deployment Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        GitHub Repository                         │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  main branch                                              │   │
-│  │    │                                                      │   │
-│  │    ├── Push triggers GitHub Actions                       │   │
-│  │    │                                                      │   │
-│  │    ▼                                                      │   │
-│  │  ┌────────────────────────────────────────────────────┐  │   │
-│  │  │  CI/CD Pipeline                                     │  │   │
-│  │  │  1. Lint & Type Check                               │  │   │
-│  │  │  2. Run Tests                                       │  │   │
-│  │  │  3. Build Frontend                                  │  │   │
-│  │  │  4. Deploy Worker → Cloudflare Workers              │  │   │
-│  │  │  5. Deploy Frontend → Cloudflare Pages              │  │   │
-│  │  └────────────────────────────────────────────────────┘  │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
+- Frontend: static build on Cloudflare Pages. `VITE_API_URL` points at the Worker (or leave it as `/api` if you route the Worker on the same hostname).
+- Worker: `wrangler deploy` after `wrangler d1 migrations apply --remote`.
+- CI (`.github/workflows/ci.yml`): lint, typecheck, tests and build for both packages on every push and PR; deploys from `main` when Cloudflare credentials are configured.

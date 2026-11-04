@@ -1,325 +1,74 @@
 # Contributing to CloudVault
 
-Thank you for your interest in contributing to CloudVault! This document provides guidelines and instructions for contributing.
+Thanks for helping. CloudVault guards other people's passwords, so changes are held to a careful standard: small, tested, and explained.
 
-## Code of Conduct
+## Setup
 
-By participating in this project, you agree to maintain a respectful and inclusive environment for everyone.
-
-## Getting Started
-
-### Prerequisites
-
-- Node.js 18+
-- npm 9+
-- Git
-- Cloudflare account (for testing)
-
-### Development Setup
-
-1. **Fork the repository** on GitHub
-
-2. **Clone your fork**:
-   ```bash
-   git clone https://github.com/your-username/cloudvault.git
-   cd cloudvault
-   ```
-
-3. **Install dependencies**:
-   ```bash
-   cd frontend && npm install && cd ..
-   cd worker && npm install && cd ..
-   ```
-
-4. **Set up local environment**:
-   ```bash
-   # Create local secrets file
-   cp worker/.dev.vars.example worker/.dev.vars
-   # Edit .dev.vars with your test credentials
-   ```
-
-5. **Create local database**:
-   ```bash
-   cd worker
-   wrangler d1 create cloudvault-db --local
-   npm run db:migrate
-   ```
-
-6. **Start development servers**:
-   ```bash
-   # Terminal 1: Worker
-   cd worker && npm run dev
-
-   # Terminal 2: Frontend
-   cd frontend && npm run dev
-   ```
-
-7. Visit `http://localhost:5173`
-
-## Development Workflow
-
-### Branch Naming
-
-Use descriptive branch names:
-- `feature/add-password-generator`
-- `fix/clipboard-clear-bug`
-- `docs/update-api-reference`
-- `refactor/improve-crypto-module`
-
-### Making Changes
-
-1. **Create a branch**:
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
-
-2. **Make your changes** following the code style guidelines
-
-3. **Run tests**:
-   ```bash
-   cd frontend && npm run test
-   ```
-
-4. **Run linting**:
-   ```bash
-   cd frontend && npm run lint
-   cd ../worker && npm run typecheck
-   ```
-
-5. **Commit your changes**:
-   ```bash
-   git add .
-   git commit -m "feat: add password strength indicator"
-   ```
-
-### Commit Message Format
-
-Follow [Conventional Commits](https://www.conventionalcommits.org/):
-
-```
-<type>(<scope>): <description>
-
-[optional body]
-
-[optional footer]
-```
-
-**Types:**
-- `feat`: New feature
-- `fix`: Bug fix
-- `docs`: Documentation only
-- `style`: Code style (formatting, no logic change)
-- `refactor`: Code refactoring
-- `test`: Adding or updating tests
-- `chore`: Maintenance tasks
-
-**Examples:**
-```
-feat(auth): add magic link expiration warning
-fix(crypto): handle empty password edge case
-docs(api): add rate limit documentation
-refactor(vault): extract secret list filtering logic
-```
-
-### Pull Request Process
-
-1. **Update documentation** if needed
-2. **Add tests** for new functionality
-3. **Ensure all checks pass**
-4. **Create a pull request** with:
-   - Clear title following commit format
-   - Description of changes
-   - Screenshots for UI changes
-   - Link to related issue (if any)
-
-5. **Address review feedback**
-6. **Squash commits** if requested
-
-## Code Style Guidelines
-
-### TypeScript
-
-- Use TypeScript for all new code
-- Enable strict mode
-- Prefer `interface` over `type` for object shapes
-- Use explicit return types for functions
-
-```typescript
-// Good
-interface User {
-  id: string;
-  email: string;
-}
-
-function getUser(id: string): Promise<User> {
-  // ...
-}
-
-// Avoid
-type User = {
-  id: string;
-  email: string;
-}
-
-function getUser(id) {
-  // ...
-}
-```
-
-### React
-
-- Use functional components with hooks
-- Use named exports for components
-- Keep components focused and small
-- Extract reusable logic into custom hooks
-
-```typescript
-// Good
-export function SecretCard({ secret, onEdit }: SecretCardProps) {
-  const { copy, copied } = useClipboard();
-  // ...
-}
-
-// Avoid
-export default class SecretCard extends React.Component {
-  // ...
-}
-```
-
-### CSS/Tailwind
-
-- Use Tailwind utility classes
-- Extract common patterns to components
-- Support dark mode for all UI
-- Ensure accessible color contrast
-
-```tsx
-// Good
-<button className="px-4 py-2 bg-vault-600 text-white rounded-lg hover:bg-vault-700 dark:bg-vault-500">
-  Save
-</button>
-```
-
-### API Routes
-
-- Use Zod for input validation
-- Return consistent error responses
-- Log audit events for sensitive actions
-- Include appropriate HTTP status codes
-
-```typescript
-// Good
-secretsRoutes.post('/:orgId/secrets', async (c) => {
-  const data = await validateBody(c, createSecretSchema);
-  // ...
-  audit.log('CREATE_SECRET', { /* ... */ });
-  return c.json(result, 201);
-});
-```
-
-## Testing
-
-Comprehensive testing ensures CloudVault's security and reliability. See [TESTING.md](docs/TESTING.md) for detailed documentation.
-
-### Running Tests
+Requires Node.js 22+ (the worker tests use Node's built-in SQLite).
 
 ```bash
-# Frontend tests
-cd frontend
-npm test              # Watch mode (development)
-npm run test -- --run # Single run (CI)
-npm run test:coverage # With coverage report
-
-# Worker tests
-cd worker
-npm test              # Watch mode
-npm run test:run      # Single run
-npm run test:coverage # With coverage
+git clone https://github.com/<you>/CloudVault.git
+cd CloudVault
+(cd worker && npm install && cp .dev.vars.example .dev.vars)
+(cd frontend && npm install)
 ```
 
-### Test Categories
+Edit `worker/.dev.vars` (at minimum `JWT_SECRET` and `APP_URL=http://localhost:5173`), then:
 
-| Category | Location | Purpose |
-|----------|----------|---------|
-| **Unit** | `*.test.ts` | Individual functions/components |
-| **Component** | `components.test.tsx` | React component behavior |
-| **Integration** | `integration.test.ts` | Full user flows |
-| **Validation** | `validation.test.ts` | API input validation |
-
-### Writing Tests
-
-Follow these principles:
-
-1. **Test behavior, not implementation**
-2. **Use descriptive test names**
-3. **Follow Arrange-Act-Assert pattern**
-4. **Cover edge cases** (empty, unicode, max length)
-5. **Keep tests independent**
-
-```typescript
-describe('useClipboard', () => {
-  it('should copy text to clipboard', async () => {
-    // Arrange
-    const { result } = renderHook(() => useClipboard());
-    
-    // Act
-    await act(async () => {
-      await result.current.copy('test');
-    });
-    
-    // Assert
-    expect(result.current.copied).toBe(true);
-  });
-
-  it('should auto-clear after timeout', async () => {
-    const { result } = renderHook(() => useClipboard({ clearAfterSeconds: 5 }));
-    await act(async () => {
-      await result.current.copy('sensitive');
-    });
-    
-    // Fast-forward time
-    vi.advanceTimersByTime(5000);
-    
-    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith('');
-  });
-});
+```bash
+cd worker && npm run db:migrate && npm run dev     # terminal 1, API on :8787
+cd frontend && npm run dev                          # terminal 2, app on :5173
 ```
 
-### Coverage Requirements
+Magic links are printed in terminal 1 when no Resend key is set.
 
-New code should maintain or improve test coverage:
-- **Minimum**: 60% coverage for new files
-- **Target**: 70%+ for critical paths (crypto, auth)
+## Before opening a pull request
 
-## Security Considerations
+Run the same checks CI runs, in both `worker/` and `frontend/`:
 
-When contributing security-related code:
+```bash
+npm run lint
+npm run typecheck
+npm run test:run
+```
 
-1. **Never log sensitive data** (passwords, keys, tokens)
-2. **Use constant-time comparison** for secrets
-3. **Validate all inputs** on the server
-4. **Sanitize outputs** to prevent XSS
-5. **Follow the zero-knowledge principle** - server should never see plaintext
+and `npm run build` in `frontend/`.
 
-For security vulnerabilities, please report privately rather than opening a public issue.
+## Ground rules
 
-## Documentation
+**Security**
+- The server must never receive plaintext secrets, master passwords, private keys or org keys. If a feature seems to need that, it needs a different design.
+- New cryptography goes in `frontend/src/lib/crypto.ts` (or a sibling module), uses Web Crypto only, and comes with tests. Don't add crypto dependencies.
+- Changing how items are encrypted means a new `enc_version`, keeping old versions readable.
+- Every route that reads a body uses a Zod schema from `worker/src/lib/validation.ts`, and every org route starts with `requireMembership(c, orgId, minRole)`.
+- Security-relevant actions write an audit entry (add new actions to `AUDIT_ACTIONS`).
 
-- Update README.md for user-facing changes
-- Update docs/API.md for API changes
-- Add JSDoc comments for public functions
-- Include code examples where helpful
+**Free plan**
+- No new Cloudflare bindings beyond D1 without a strong reason. KV was removed on purpose.
+- Keep server CPU tiny (no slow KDFs in the Worker).
+- Stay well under 50 D1 queries per request; use `DB.batch()` for multi-step changes and `json_each` for bulk rows.
 
-## Questions?
+**Database**
+- Schema changes are new files in `worker/migrations/` (`000N_description.sql`). Never edit a migration that has shipped.
 
-- Open a GitHub Discussion in the repository for questions
-- Check existing issues before creating new ones
-- Join our community chat (if available)
+**Frontend**
+- All API calls go through `src/lib/api.ts`.
+- Use the primitives in `components/ui/kit.tsx`, and check dark mode and a 390 px wide screen.
+- Keys stay in memory. Navigate with the router, not full page loads.
 
-## License
+## Tests
 
-By contributing, you agree that your contributions will be licensed under the project's MIT License.
+- Worker route tests (`worker/src/__tests__`) run the app against real migrations through a D1 shim. Use `createTestContext()` and `createOrgFixture()` from `helpers/app.ts`.
+- Frontend library tests run in the Node environment (`// @vitest-environment node`); component tests run in jsdom.
+- Bug fixes come with a test that fails without the fix.
 
----
+See [docs/TESTING.md](docs/TESTING.md).
 
-Thank you for contributing to CloudVault! Your help makes this project better for everyone.
+## Commits and pull requests
+
+- One logical change per pull request, with a description of what changed and why, and how you tested it.
+- Note any migration, new setting or behavior change in `CHANGELOG.md` under "Unreleased".
+
+## Reporting security issues
+
+Please don't open a public issue. Use GitHub's private vulnerability reporting (Security tab). See [docs/SECURITY.md](docs/SECURITY.md#reporting-a-vulnerability).

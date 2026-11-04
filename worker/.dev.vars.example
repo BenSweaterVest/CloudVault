@@ -1,10 +1,10 @@
 # CloudVault Worker Environment Variables
 # Copy this file to .dev.vars and fill in your values
 
-# GitHub OAuth (required)
+# GitHub OAuth (optional; without it the GitHub button is hidden)
 # Create at: https://github.com/settings/applications/new
-GITHUB_CLIENT_ID=your_github_client_id
-GITHUB_CLIENT_SECRET=your_github_client_secret
+# GITHUB_CLIENT_ID=your_github_client_id
+# GITHUB_CLIENT_SECRET=your_github_client_secret
 
 # JWT Secret (required)
 # Generate a secure random string for signing tokens
@@ -15,12 +15,16 @@ JWT_SECRET=your_secure_random_string_at_least_32_characters
 APP_URL=http://localhost:5173
 
 # Resend API Key (optional, for magic link emails)
+# Without it, local magic links are printed in the `npm run dev` output.
 # Get one at: https://resend.com
-RESEND_API_KEY=re_your_resend_api_key
+# RESEND_API_KEY=re_your_resend_api_key
 
 # Email sender address (optional)
 # Default: CloudVault <noreply@cloudvault.app>
 # EMAIL_FROM=YourApp <noreply@yourdomain.com>
+
+# Set to false to allow sign-in only for invited users (optional, default true)
+# ALLOW_SIGNUPS=true
 
 # Magic link expiration in minutes (optional)
 # Default: 15

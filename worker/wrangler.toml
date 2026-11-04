@@ -2,37 +2,48 @@ name = "cloudvault-api"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 
+# Everything here fits the Cloudflare Workers free plan:
+#   - one D1 database (no KV, R2 or Durable Objects)
+#   - one daily Cron Trigger for cleanup (free plan allows 5)
+
 [vars]
 ENVIRONMENT = "development"
+# Set to "false" to allow sign-in only for people an admin has invited.
+ALLOW_SIGNUPS = "true"
 
 # =============================================================================
 # D1 DATABASE
 # =============================================================================
-# Create with: wrangler d1 create cloudvault-db
-# Then replace YOUR_DATABASE_ID_HERE with the id from the output
+# Create with: npx wrangler d1 create cloudvault-db
+# Then replace YOUR_DATABASE_ID_HERE with the id from the output.
+# Apply schema with: npm run db:migrate (local) / npm run db:migrate:prod
 [[d1_databases]]
 binding = "DB"
 database_name = "cloudvault-db"
 database_id = "YOUR_DATABASE_ID_HERE"
+migrations_dir = "migrations"
 
 # =============================================================================
-# KV NAMESPACE (for rate limiting, token blacklist, session tracking)
+# DAILY MAINTENANCE
 # =============================================================================
-# Create with: wrangler kv:namespace create "RATE_LIMIT"
-# Then replace YOUR_KV_NAMESPACE_ID_HERE with the id from the output
-[[kv_namespaces]]
-binding = "KV"
-id = "YOUR_KV_NAMESPACE_ID_HERE"
+# Deletes expired sessions, rate limit counters and magic links, clears dead
+# share link ciphertext, and applies each org's audit log retention.
+[triggers]
+crons = ["17 3 * * *"]
 
 # =============================================================================
-# SECRETS (set via wrangler secret put <NAME>)
+# SECRETS (set with: npx wrangler secret put <NAME>)
 # =============================================================================
-# Required secrets:
-#   wrangler secret put GITHUB_CLIENT_ID
-#   wrangler secret put GITHUB_CLIENT_SECRET
-#   wrangler secret put JWT_SECRET
-#   wrangler secret put APP_URL
+# Required:
+#   GITHUB_CLIENT_ID
+#   GITHUB_CLIENT_SECRET
+#   JWT_SECRET            at least 32 random characters
+#   APP_URL               your frontend URL, e.g. https://vault.example.org
 #
-# Optional secrets:
-#   wrangler secret put RESEND_API_KEY    # For magic link emails
-#   wrangler secret put EMAIL_FROM        # Custom sender address
+# Optional:
+#   RESEND_API_KEY        enables magic link, invite and emergency emails
+#   EMAIL_FROM            sender, e.g. "CloudVault <vault@example.org>"
+#   MAGIC_LINK_EXPIRY_MINUTES  5 to 60, default 15
+#
+# For production also set ENVIRONMENT = "production" (in [vars] or an
+# [env.production] block).

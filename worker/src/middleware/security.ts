@@ -1,84 +1,58 @@
 /**
- * Security Headers Middleware
- * 
- * Adds essential security headers to all responses.
+ * Security headers and CORS origin policy.
  */
 
-import { Context, Next } from 'hono';
-import type { Env, Variables } from '../index';
+import type { Next } from 'hono';
+import type { AppContext } from '../env';
 
-/**
- * Security headers middleware
- * Adds CSP, X-Frame-Options, and other security headers
- */
-export async function securityHeaders(
-  c: Context<{ Bindings: Env; Variables: Variables }>,
-  next: Next
-) {
+function isLocalhostUrl(value: string): boolean {
+  try {
+    const { hostname } = new URL(value);
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
+/** Adds security headers to every API response. */
+export async function securityHeaders(c: AppContext, next: Next) {
   await next();
-  
-  // Only add headers to successful responses
-  if (c.res) {
-    const headers = c.res.headers;
-    
-    // Prevent clickjacking
-    headers.set('X-Frame-Options', 'DENY');
-    
-    // Prevent MIME type sniffing
-    headers.set('X-Content-Type-Options', 'nosniff');
-    
-    // Control referrer information
-    headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
-    
-    // Prevent XSS attacks (legacy, but still useful)
-    headers.set('X-XSS-Protection', '1; mode=block');
-    
-    // Content Security Policy
-    // Strict CSP for API responses
-    if (c.req.path.startsWith('/api')) {
-      headers.set(
-        'Content-Security-Policy',
-        "default-src 'none'; frame-ancestors 'none'"
-      );
-    }
-    
-    // Permissions Policy (formerly Feature-Policy)
-    headers.set(
-      'Permissions-Policy',
-      'camera=(), microphone=(), geolocation=(), interest-cohort=()'
-    );
-    
-    // Strict Transport Security (HSTS)
-    // Only in production (when not localhost)
-    if (!c.env.APP_URL?.includes('localhost')) {
-      headers.set(
-        'Strict-Transport-Security',
-        'max-age=31536000; includeSubDomains; preload'
-      );
-    }
+
+  const headers = c.res.headers;
+  headers.set('X-Frame-Options', 'DENY');
+  headers.set('X-Content-Type-Options', 'nosniff');
+  headers.set('Referrer-Policy', 'no-referrer');
+  headers.set('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'");
+  headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  headers.set('Cross-Origin-Resource-Policy', 'same-site');
+  // API responses can contain ciphertext and personal data; never cache them.
+  if (!headers.has('Cache-Control')) {
+    headers.set('Cache-Control', 'no-store');
+  }
+  if (!isLocalhostUrl(c.env.APP_URL)) {
+    headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   }
 }
 
 /**
- * CORS configuration helper for production
+ * CORS origin policy.
+ *
+ * - Production: only the exact APP_URL origin.
+ * - Development (APP_URL is localhost): any localhost origin, so the Vite dev
+ *   server works on any port.
+ *
+ * Returns null to deny.
  */
 export function getCorsOrigin(origin: string | undefined, appUrl: string): string | null {
-  // In development, allow localhost origins
-  if (appUrl.includes('localhost')) {
-    if (origin?.includes('localhost')) {
-      return origin;
-    }
+  let appOrigin: string;
+  try {
+    appOrigin = new URL(appUrl).origin;
+  } catch {
+    return null;
   }
-  
-  // In production, only allow the configured APP_URL
-  if (origin === appUrl) {
-    return origin;
-  }
-  
-  // Also allow same-origin requests (no origin header)
-  if (!origin) {
-    return appUrl;
-  }
-  
+
+  if (!origin) return appOrigin;
+  if (origin === appOrigin) return origin;
+  if (isLocalhostUrl(appUrl) && isLocalhostUrl(origin)) return origin;
   return null;
 }
