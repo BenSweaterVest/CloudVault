@@ -1,487 +1,377 @@
 /**
- * CloudVault Vault Hook
- * 
- * Manages vault state including decrypted keys and secrets.
- * Implements zero-knowledge architecture - keys are stored in memory only,
- * never in localStorage or sent to the server in plaintext.
- * 
- * @module hooks/useVault
- * 
- * Security Notes:
- * - Private key is derived from master password and stored in memory
- * - Organization keys are decrypted client-side and stored in memory
- * - All encryption/decryption happens in the browser
- * - Locking the vault clears all keys from memory
- * 
- * @example
- * ```tsx
- * const { isUnlocked, unlock, secrets, decryptSecretData } = useVault();
- * 
- * // Unlock vault with master password
- * await unlock('my-master-password');
- * 
- * // Decrypt a secret's data
- * const decrypted = await decryptSecretData(secrets[0]);
- * console.log(decrypted.password);
- * ```
+ * Vault state: the unlocked private key, decrypted org keys, the selected
+ * organization and its secret list, plus encrypted CRUD helpers.
+ *
+ * Keys live only in memory. Locking (manually, on idle, or on sign-out)
+ * drops them.
  */
 
-import { createContext, useContext, useState, useCallback, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useAuth } from '../lib/auth';
-import { orgsApi, secretsApi, type Organization, type Secret } from '../lib/api';
 import {
-  unlockPrivateKey,
+  orgsApi,
+  secretsApi,
+  type Organization,
+  type Secret,
+  type SecretInput,
+  type SecretMeta,
+} from '../lib/api';
+import {
+  createOrganizationKeys,
   decryptOrgKey,
-  encryptSecret,
-  decryptSecret,
-  type SecretData,
+  decryptSecretPayload,
+  encryptSecretPayload,
+  unwrapPrivateKey,
+  type SecretPayload,
 } from '../lib/crypto';
 
-// ============================================
-// TYPE DEFINITIONS
-// ============================================
+const LAST_ORG_KEY = 'cloudvault_last_org';
 
-/**
- * Decrypted secret data with metadata
- * 
- * Extends SecretData with additional fields from the Secret model.
- */
-interface DecryptedSecret extends SecretData {
-  /** Unique secret identifier */
-  id: string;
-  /** Display name */
-  name: string;
-  /** Associated URL (nullable) */
-  url: string | null;
-  /** Unencrypted username hint for search */
-  usernameHint: string | null;
-  /** Version number for history tracking */
-  version: number;
-  /** Last modification timestamp */
-  updatedAt: string;
+export interface OpenedSecret {
+  secret: Secret;
+  payload: SecretPayload;
 }
 
-/**
- * Vault context type definition
- * 
- * Provides all state and methods needed for vault operations.
- */
 interface VaultContextType {
-  // ---- State ----
-  /** Whether the vault is unlocked (private key in memory) */
   isUnlocked: boolean;
-  /** Currently selected organization */
-  currentOrg: Organization | null;
-  /** All organizations user has access to */
-  organizations: Organization[];
-  /** Secrets in current organization (encrypted) */
-  secrets: Secret[];
-  /** Loading state for async operations */
   isLoading: boolean;
-  /** Error message from last failed operation */
   error: string | null;
-  
-  // ---- Actions ----
-  /** Unlock vault with master password */
-  unlock: (masterPassword: string) => Promise<void>;
-  /** Lock vault (clear all keys from memory) */
-  lock: () => void;
-  /** Select an organization and load its secrets */
-  selectOrg: (orgId: string) => Promise<void>;
-  /** Reload organizations list */
-  loadOrganizations: () => Promise<void>;
-  /** Reload secrets for current organization */
-  loadSecrets: () => Promise<void>;
-  
-  // ---- Secret Operations ----
-  /** Decrypt a secret's encrypted data */
-  decryptSecretData: (secret: Secret) => Promise<DecryptedSecret>;
-  /** Create and encrypt a new secret */
-  createSecret: (data: { name: string; url?: string; usernameHint?: string } & SecretData) => Promise<Secret>;
-  /** Update and re-encrypt a secret */
-  updateSecret: (secretId: string, data: { name?: string; url?: string; usernameHint?: string } & Partial<SecretData>) => Promise<Secret>;
-  /** Delete a secret */
-  deleteSecret: (secretId: string) => Promise<void>;
-  
-  // ---- Key Access ----
-  /** Get current org key (for admin operations like adding users) */
-  getOrgKey: () => CryptoKey | null;
-}
+  organizations: Organization[];
+  pendingInvites: Array<{ id: string; name: string }>;
+  currentOrg: Organization | null;
+  secrets: SecretMeta[];
 
-// ============================================
-// CONTEXT
-// ============================================
+  unlock: (masterPassword: string) => Promise<void>;
+  lock: () => void;
+  loadOrganizations: () => Promise<Organization[]>;
+  selectOrg: (orgId: string) => Promise<void>;
+  refreshSecrets: () => Promise<void>;
+  createOrganization: (name: string) => Promise<Organization>;
+
+  /** Fetch (audited) and decrypt one secret. */
+  openSecret: (secretId: string) => Promise<OpenedSecret>;
+  /** Decrypt any record of the current org (e.g. history entries). */
+  decryptRecord: (secretId: string, record: { ciphertextBlob: string; iv: string; encVersion?: number }) => Promise<SecretPayload>;
+  createSecret: (input: SecretInput, payload: SecretPayload) => Promise<Secret>;
+  /** Pass `payload` to change the encrypted content; omit to change metadata only. */
+  updateSecret: (secretId: string, input: Partial<SecretInput>, payload?: SecretPayload, expectedVersion?: number) => Promise<Secret>;
+  deleteSecret: (secretId: string) => Promise<void>;
+  toggleFavorite: (secretId: string) => Promise<void>;
+  /** Encrypt many payloads for import (current format, client ids). */
+  encryptForImport: (items: Array<SecretInput & { payload: SecretPayload }>) => Promise<Array<SecretInput & { id: string; ciphertextBlob: string; iv: string; encVersion: 1 | 2 }>>;
+
+  getOrgKey: () => CryptoKey | null;
+  getPrivateKey: () => CryptoKey | null;
+  /** Forget a cached org key (after rotation) and reload orgs. */
+  reloadOrgKeys: () => Promise<void>;
+}
 
 const VaultContext = createContext<VaultContextType | null>(null);
 
-/**
- * Hook to access vault context
- * 
- * Provides access to vault state and operations including:
- * - Lock/unlock vault
- * - Organization management
- * - Secret CRUD operations with encryption
- * 
- * @returns {VaultContextType} Vault state and methods
- * @throws {Error} If used outside of VaultProvider
- * 
- * @example
- * ```tsx
- * function SecretsList() {
- *   const { secrets, decryptSecretData, isLoading } = useVault();
- *   
- *   const handleView = async (secret: Secret) => {
- *     const decrypted = await decryptSecretData(secret);
- *     console.log('Password:', decrypted.password);
- *   };
- *   
- *   if (isLoading) return <Spinner />;
- *   return <ul>{secrets.map(s => ...)}</ul>;
- * }
- * ```
- */
 export function useVault(): VaultContextType {
   const context = useContext(VaultContext);
-  if (!context) {
-    throw new Error('useVault must be used within a VaultProvider');
-  }
+  if (!context) throw new Error('useVault must be used within a VaultProvider');
   return context;
 }
 
-// ============================================
-// PROVIDER
-// ============================================
-
-/**
- * Props for VaultProvider component
- */
-interface VaultProviderProps {
-  /** Child components that will have access to vault context */
-  children: ReactNode;
+function rememberOrg(orgId: string | null) {
+  try {
+    if (orgId) localStorage.setItem(LAST_ORG_KEY, orgId);
+    else localStorage.removeItem(LAST_ORG_KEY);
+  } catch {
+    // ignore
+  }
 }
 
-/**
- * Vault Provider Component
- * 
- * Wraps the application to provide vault state and cryptographic operations.
- * Manages the lifecycle of encryption keys in memory.
- * 
- * Security: All cryptographic keys are stored in React state (memory only).
- * When the vault is locked or the page is refreshed, keys are cleared.
- * 
- * @param {VaultProviderProps} props - Provider props
- * @returns {JSX.Element} Provider component wrapping children
- * 
- * @example
- * ```tsx
- * // In main App component, nest inside AuthProvider
- * function App() {
- *   return (
- *     <AuthProvider>
- *       <VaultProvider>
- *         <Router>
- *           <Routes />
- *         </Router>
- *       </VaultProvider>
- *     </AuthProvider>
- *   );
- * }
- * ```
- */
-export function VaultProvider({ children }: VaultProviderProps): JSX.Element {
+function lastOrg(): string | null {
+  try {
+    return localStorage.getItem(LAST_ORG_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function VaultProvider({ children }: { children: ReactNode }): JSX.Element {
   const { user } = useAuth();
-  
-  // Crypto keys (IN MEMORY ONLY - critical for security)
+
   const [privateKey, setPrivateKey] = useState<CryptoKey | null>(null);
-  const [orgKeys, setOrgKeys] = useState<Map<string, CryptoKey>>(new Map());
-  
-  // Data state
+  const orgKeys = useRef(new Map<string, CryptoKey>());
   const [organizations, setOrganizations] = useState<Organization[]>([]);
+  const [pendingInvites, setPendingInvites] = useState<Array<{ id: string; name: string }>>([]);
   const [currentOrg, setCurrentOrg] = useState<Organization | null>(null);
-  const [secrets, setSecrets] = useState<Secret[]>([]);
+  const [secrets, setSecrets] = useState<SecretMeta[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const isUnlocked = privateKey !== null;
-
-  /**
-   * Unlock the vault with master password
-   */
-  const unlock = useCallback(async (masterPassword: string) => {
-    if (!user?.encryptedPrivateKey || !user?.salt) {
-      throw new Error('User keys not set up');
-    }
-    
-    setIsLoading(true);
-    setError(null);
-    
-    try {
-      const key = await unlockPrivateKey(
-        user.encryptedPrivateKey,
-        user.salt,
-        masterPassword
-      );
-      setPrivateKey(key);
-    } catch (err) {
-      setError('Invalid master password');
-      throw err;
-    } finally {
-      setIsLoading(false);
-    }
-  }, [user]);
-
-  /**
-   * Lock the vault (clear all keys from memory)
-   */
   const lock = useCallback(() => {
     setPrivateKey(null);
-    setOrgKeys(new Map());
+    orgKeys.current = new Map();
     setSecrets([]);
     setCurrentOrg(null);
+    setOrganizations([]);
+    setPendingInvites([]);
   }, []);
 
-  /**
-   * Load user's organizations
-   */
+  // Signing out (or switching user) always locks.
+  useEffect(() => {
+    lock();
+  }, [user?.id, lock]);
+
+  const requireOrgKey = useCallback(
+    (org: Organization | null = currentOrg): { org: Organization; key: CryptoKey } => {
+      if (!org) throw new Error('No organization selected');
+      const key = orgKeys.current.get(org.id);
+      if (!key) throw new Error('Vault is locked');
+      return { org, key };
+    },
+    [currentOrg]
+  );
+
+  const unlock = useCallback(
+    async (masterPassword: string) => {
+      if (!user?.encryptedPrivateKey || !user.salt) throw new Error('Your master password has not been set up yet');
+      setIsLoading(true);
+      setError(null);
+      try {
+        const key = await unwrapPrivateKey(user.encryptedPrivateKey, user.salt, masterPassword, user.kdfIterations);
+        setPrivateKey(key);
+      } catch {
+        setError('Incorrect master password');
+        throw new Error('Incorrect master password');
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [user]
+  );
+
+  const fetchSecrets = useCallback(async (orgId: string) => {
+    const list = await secretsApi.list(orgId);
+    setSecrets(list);
+  }, []);
+
+  const activateOrg = useCallback(
+    async (org: Organization, key: CryptoKey | null = privateKey) => {
+      if (!key) throw new Error('Vault is locked');
+      if (!orgKeys.current.has(org.id)) {
+        orgKeys.current.set(org.id, await decryptOrgKey(org.encryptedOrgKey, key));
+      }
+      setCurrentOrg(org);
+      rememberOrg(org.id);
+      await fetchSecrets(org.id);
+    },
+    [privateKey, fetchSecrets]
+  );
+
   const loadOrganizations = useCallback(async () => {
     setIsLoading(true);
     setError(null);
-    
     try {
-      const orgs = await orgsApi.list();
+      const { organizations: orgs, pendingInvites: pending } = await orgsApi.list();
       setOrganizations(orgs);
-      
-      // Auto-select first org if only one
-      if (orgs.length === 1 && !currentOrg) {
-        setCurrentOrg(orgs[0]);
+      setPendingInvites(pending);
+
+      if (privateKey && orgs.length > 0) {
+        const keep = currentOrg && orgs.find((o) => o.id === currentOrg.id);
+        const preferred = keep || orgs.find((o) => o.id === lastOrg()) || orgs[0];
+        await activateOrg(preferred);
+      } else if (orgs.length === 0) {
+        setCurrentOrg(null);
+        setSecrets([]);
       }
+      return orgs;
     } catch (err) {
-      setError('Failed to load organizations');
+      setError(err instanceof Error ? err.message : 'Failed to load organizations');
       throw err;
     } finally {
       setIsLoading(false);
     }
-  }, [currentOrg]);
+  }, [privateKey, currentOrg, activateOrg]);
 
-  /**
-   * Select an organization and decrypt its key
-   */
-  const selectOrg = useCallback(async (orgId: string) => {
-    if (!privateKey) {
-      throw new Error('Vault is locked');
-    }
-    
-    const org = organizations.find(o => o.id === orgId);
-    if (!org) {
-      throw new Error('Organization not found');
-    }
-    
-    setIsLoading(true);
-    setError(null);
-    
-    try {
-      // Check if we already have the org key
-      if (!orgKeys.has(orgId)) {
-        // Decrypt org key with user's private key
-        const orgKey = await decryptOrgKey(org.encryptedOrgKey, privateKey);
-        setOrgKeys(prev => new Map(prev).set(orgId, orgKey));
+  // Load organizations as soon as the vault is unlocked.
+  useEffect(() => {
+    if (privateKey) void loadOrganizations().catch(() => undefined);
+    // Only on unlock; loadOrganizations identity changes with currentOrg.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [privateKey]);
+
+  const selectOrg = useCallback(
+    async (orgId: string) => {
+      const org = organizations.find((o) => o.id === orgId);
+      if (!org) throw new Error('Organization not found');
+      setIsLoading(true);
+      setError(null);
+      try {
+        await activateOrg(org);
+      } catch (err) {
+        setError('Could not open this organization');
+        throw err;
+      } finally {
+        setIsLoading(false);
       }
-      
+    },
+    [organizations, activateOrg]
+  );
+
+  const refreshSecrets = useCallback(async () => {
+    if (currentOrg) await fetchSecrets(currentOrg.id);
+  }, [currentOrg, fetchSecrets]);
+
+  const createOrganization = useCallback(
+    async (name: string) => {
+      if (!user?.publicKey) throw new Error('Set up your master password first');
+      const { orgKey, encryptedOrgKey } = await createOrganizationKeys(user.publicKey);
+      const org = await orgsApi.create({ name, encryptedOrgKey });
+      orgKeys.current.set(org.id, orgKey);
+      setOrganizations((prev) => [...prev, org].sort((a, b) => a.name.localeCompare(b.name)));
       setCurrentOrg(org);
-      
-      // Load secrets for the org
-      const secretsList = await secretsApi.list(orgId);
-      setSecrets(secretsList);
-    } catch (err) {
-      setError('Failed to load organization');
-      throw err;
-    } finally {
-      setIsLoading(false);
-    }
-  }, [privateKey, organizations, orgKeys]);
+      rememberOrg(org.id);
+      setSecrets([]);
+      return org;
+    },
+    [user]
+  );
 
-  /**
-   * Load secrets for current organization
-   */
-  const loadSecrets = useCallback(async () => {
-    if (!currentOrg) {
-      throw new Error('No organization selected');
-    }
-    
-    setIsLoading(true);
-    
-    try {
-      const secretsList = await secretsApi.list(currentOrg.id);
-      setSecrets(secretsList);
-    } catch (err) {
-      setError('Failed to load secrets');
-      throw err;
-    } finally {
-      setIsLoading(false);
-    }
-  }, [currentOrg]);
+  const openSecret = useCallback(
+    async (secretId: string) => {
+      const { org, key } = requireOrgKey();
+      const secret = await secretsApi.get(org.id, secretId);
+      const payload = await decryptSecretPayload(secret, key, org.id, secret.id);
+      return { secret, payload };
+    },
+    [requireOrgKey]
+  );
 
-  /**
-   * Decrypt a secret's data
-   */
-  const decryptSecretData = useCallback(async (secret: Secret): Promise<DecryptedSecret> => {
-    if (!currentOrg) {
-      throw new Error('No organization selected');
-    }
-    
-    const orgKey = orgKeys.get(currentOrg.id);
-    if (!orgKey) {
-      throw new Error('Organization key not loaded');
-    }
-    
-    const data = await decryptSecret(
-      { ciphertext: secret.ciphertextBlob, iv: secret.iv },
-      orgKey
-    );
-    
-    return {
-      ...data,
-      id: secret.id,
-      name: secret.name,
-      url: secret.url,
-      usernameHint: secret.usernameHint,
-      version: secret.version,
-      updatedAt: secret.updatedAt,
-    };
-  }, [currentOrg, orgKeys]);
+  const decryptRecord = useCallback<VaultContextType['decryptRecord']>(
+    async (secretId, record) => {
+      const { org, key } = requireOrgKey();
+      return decryptSecretPayload(record, key, org.id, secretId);
+    },
+    [requireOrgKey]
+  );
 
-  /**
-   * Create a new secret
-   */
-  const createSecret = useCallback(async (
-    data: { name: string; url?: string; usernameHint?: string } & SecretData
-  ): Promise<Secret> => {
-    if (!currentOrg) {
-      throw new Error('No organization selected');
-    }
-    
-    const orgKey = orgKeys.get(currentOrg.id);
-    if (!orgKey) {
-      throw new Error('Organization key not loaded');
-    }
-    
-    // Encrypt the secret data
-    const { ciphertext, iv } = await encryptSecret(
-      { username: data.username, password: data.password, notes: data.notes },
-      orgKey
-    );
-    
-    // Create on server
-    const secret = await secretsApi.create(currentOrg.id, {
-      name: data.name,
-      url: data.url,
-      usernameHint: data.usernameHint,
-      ciphertextBlob: ciphertext,
-      iv,
-    });
-    
-    // Update local state
-    setSecrets(prev => [...prev, secret]);
-    
-    return secret;
-  }, [currentOrg, orgKeys]);
-
-  /**
-   * Update an existing secret
-   */
-  const updateSecret = useCallback(async (
-    secretId: string,
-    data: { name?: string; url?: string; usernameHint?: string } & Partial<SecretData>
-  ): Promise<Secret> => {
-    if (!currentOrg) {
-      throw new Error('No organization selected');
-    }
-    
-    const orgKey = orgKeys.get(currentOrg.id);
-    if (!orgKey) {
-      throw new Error('Organization key not loaded');
-    }
-    
-    const updateData: Parameters<typeof secretsApi.update>[2] = {
-      name: data.name,
-      url: data.url,
-      usernameHint: data.usernameHint,
-    };
-    
-    // If secret data is being updated, re-encrypt
-    if (data.username !== undefined || data.password !== undefined) {
-      // Get current secret to merge data
-      const currentSecret = secrets.find(s => s.id === secretId);
-      if (!currentSecret) {
-        throw new Error('Secret not found');
-      }
-      
-      // Decrypt current data
-      const currentData = await decryptSecret(
-        { ciphertext: currentSecret.ciphertextBlob, iv: currentSecret.iv },
-        orgKey
-      );
-      
-      // Merge with new data
-      const mergedData: SecretData = {
-        username: data.username ?? currentData.username,
-        password: data.password ?? currentData.password,
-        notes: data.notes ?? currentData.notes,
-      };
-      
-      // Re-encrypt
-      const { ciphertext, iv } = await encryptSecret(mergedData, orgKey);
-      updateData.ciphertextBlob = ciphertext;
-      updateData.iv = iv;
-    }
-    
-    // Update on server
-    const secret = await secretsApi.update(currentOrg.id, secretId, updateData);
-    
-    // Update local state
-    setSecrets(prev => prev.map(s => s.id === secretId ? secret : s));
-    
-    return secret;
-  }, [currentOrg, orgKeys, secrets]);
-
-  /**
-   * Delete a secret
-   */
-  const deleteSecret = useCallback(async (secretId: string): Promise<void> => {
-    if (!currentOrg) {
-      throw new Error('No organization selected');
-    }
-    
-    await secretsApi.delete(currentOrg.id, secretId);
-    setSecrets(prev => prev.filter(s => s.id !== secretId));
-  }, [currentOrg]);
-
-  /**
-   * Get current org key (for admin operations like adding users)
-   */
-  const getOrgKey = useCallback((): CryptoKey | null => {
-    if (!currentOrg) return null;
-    return orgKeys.get(currentOrg.id) || null;
-  }, [currentOrg, orgKeys]);
-
-  const value: VaultContextType = {
-    isUnlocked,
-    currentOrg,
-    organizations,
-    secrets,
-    isLoading,
-    error,
-    unlock,
-    lock,
-    selectOrg,
-    loadOrganizations,
-    loadSecrets,
-    decryptSecretData,
-    createSecret,
-    updateSecret,
-    deleteSecret,
-    getOrgKey,
+  const toMeta = (s: Secret): SecretMeta => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { ciphertextBlob, iv, encVersion, ...meta } = s;
+    return meta;
   };
+
+  const createSecret = useCallback(
+    async (input: SecretInput, payload: SecretPayload) => {
+      const { org, key } = requireOrgKey();
+      const id = crypto.randomUUID();
+      const encrypted = await encryptSecretPayload(payload, key, org.id, id);
+      const created = await secretsApi.create(org.id, { ...input, ...encrypted, id });
+      setSecrets((prev) => [...prev, toMeta(created)].sort((a, b) => a.name.localeCompare(b.name)));
+      return created;
+    },
+    [requireOrgKey]
+  );
+
+  const updateSecret = useCallback<VaultContextType['updateSecret']>(
+    async (secretId, input, payload, expectedVersion) => {
+      const { org, key } = requireOrgKey();
+      const encrypted = payload ? await encryptSecretPayload(payload, key, org.id, secretId) : {};
+      const updated = await secretsApi.update(org.id, secretId, { ...input, ...encrypted, expectedVersion });
+      setSecrets((prev) => prev.map((s) => (s.id === secretId ? toMeta(updated) : s)));
+      return updated;
+    },
+    [requireOrgKey]
+  );
+
+  const deleteSecret = useCallback(
+    async (secretId: string) => {
+      const { org } = requireOrgKey();
+      await secretsApi.delete(org.id, secretId);
+      setSecrets((prev) => prev.filter((s) => s.id !== secretId));
+    },
+    [requireOrgKey]
+  );
+
+  const toggleFavorite = useCallback(
+    async (secretId: string) => {
+      const { org } = requireOrgKey();
+      const current = secrets.find((s) => s.id === secretId);
+      const next = !current?.isFavorite;
+      await secretsApi.toggleFavorite(org.id, secretId, next);
+      setSecrets((prev) => prev.map((s) => (s.id === secretId ? { ...s, isFavorite: next } : s)));
+    },
+    [requireOrgKey, secrets]
+  );
+
+  const encryptForImport = useCallback<VaultContextType['encryptForImport']>(
+    async (items) => {
+      const { org, key } = requireOrgKey();
+      return Promise.all(
+        items.map(async ({ payload, ...input }) => {
+          const id = crypto.randomUUID();
+          return { ...input, id, ...(await encryptSecretPayload(payload, key, org.id, id)) };
+        })
+      );
+    },
+    [requireOrgKey]
+  );
+
+  const getOrgKey = useCallback(() => (currentOrg ? orgKeys.current.get(currentOrg.id) ?? null : null), [currentOrg]);
+  const getPrivateKey = useCallback(() => privateKey, [privateKey]);
+
+  const reloadOrgKeys = useCallback(async () => {
+    orgKeys.current = new Map();
+    await loadOrganizations();
+  }, [loadOrganizations]);
+
+  const value = useMemo<VaultContextType>(
+    () => ({
+      isUnlocked: privateKey !== null,
+      isLoading,
+      error,
+      organizations,
+      pendingInvites,
+      currentOrg,
+      secrets,
+      unlock,
+      lock,
+      loadOrganizations,
+      selectOrg,
+      refreshSecrets,
+      createOrganization,
+      openSecret,
+      decryptRecord,
+      createSecret,
+      updateSecret,
+      deleteSecret,
+      toggleFavorite,
+      encryptForImport,
+      getOrgKey,
+      getPrivateKey,
+      reloadOrgKeys,
+    }),
+    [
+      privateKey,
+      isLoading,
+      error,
+      organizations,
+      pendingInvites,
+      currentOrg,
+      secrets,
+      unlock,
+      lock,
+      loadOrganizations,
+      selectOrg,
+      refreshSecrets,
+      createOrganization,
+      openSecret,
+      decryptRecord,
+      createSecret,
+      updateSecret,
+      deleteSecret,
+      toggleFavorite,
+      encryptForImport,
+      getOrgKey,
+      getPrivateKey,
+      reloadOrgKeys,
+    ]
+  );
 
   return <VaultContext.Provider value={value}>{children}</VaultContext.Provider>;
 }

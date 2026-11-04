@@ -1,348 +1,181 @@
 /**
- * Main Layout Component
- * 
- * Provides the application shell with responsive navigation,
- * organization selector, and user menu.
- * 
- * @module components/ui/Layout
+ * Application shell: header, navigation, organization switcher, lock and
+ * account menu. Also enforces the client-side auto-lock.
  */
 
-import { useState, useEffect, useCallback } from 'react';
-import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../lib/auth';
+import { usePreferences } from '../../lib/preferences';
 import { useVault } from '../../hooks/useVault';
+import { useSessionTimeout } from '../../hooks/useSessionTimeout';
 import { ThemeToggle } from './ThemeProvider';
 import { SkipLink, useFocusRing } from './Accessibility';
+import { LockIcon, cx } from './kit';
+import { useToast } from './Toast';
 
-interface LayoutProps {
-  children: React.ReactNode;
+const NAV = [
+  { path: '/', label: 'Passwords', adminOnly: false },
+  { path: '/health', label: 'Health', adminOnly: false },
+  { path: '/import-export', label: 'Import / Export', adminOnly: false },
+  { path: '/users', label: 'Members', adminOnly: true },
+  { path: '/audit', label: 'Audit log', adminOnly: true },
+  { path: '/settings', label: 'Settings', adminOnly: true },
+];
+
+function isTyping(target: EventTarget | null): boolean {
+  return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || (target instanceof HTMLElement && target.isContentEditable);
 }
 
-export default function Layout({ children }: LayoutProps) {
+export default function Layout({ children }: { children: ReactNode }) {
   const { user, logout } = useAuth();
+  const { preferences } = usePreferences();
   const { currentOrg, organizations, selectOrg, lock, isUnlocked } = useVault();
+  const { info } = useToast();
   const location = useLocation();
   const navigate = useNavigate();
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  
-  // Initialize focus ring detection
+  const [menuOpen, setMenuOpen] = useState(false);
+
   useFocusRing();
 
-  // Close mobile menu on route change
-  useEffect(() => {
-    setMobileMenuOpen(false);
-  }, [location.pathname]);
+  const autoLock = useCallback(() => {
+    lock();
+    info('Vault locked', 'Locked after a period of inactivity');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lock]);
 
-  // Close mobile menu on escape key
-  useEffect(() => {
-    const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && mobileMenuOpen) {
-        setMobileMenuOpen(false);
-      }
-    };
-    document.addEventListener('keydown', handleEscape);
-    return () => document.removeEventListener('keydown', handleEscape);
-  }, [mobileMenuOpen]);
+  useSessionTimeout({ timeoutMinutes: preferences.sessionTimeout, onTimeout: autoLock, enabled: isUnlocked });
 
-  // Keyboard shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Only handle shortcuts when not in input fields
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
-        return;
-      }
+  useEffect(() => setMenuOpen(false), [location.pathname]);
 
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+  // Single-key shortcuts, ignored while typing: "/" search, "n" new, "l" lock.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey || isTyping(e.target)) return;
+      if (e.key === '/') {
         e.preventDefault();
-        // Focus search - dispatch custom event
-        window.dispatchEvent(new CustomEvent('cloudvault:focus-search'));
-      } else if ((e.metaKey || e.ctrlKey) && e.key === 'n') {
-        e.preventDefault();
+        if (location.pathname !== '/') navigate('/');
+        window.setTimeout(() => window.dispatchEvent(new CustomEvent('cloudvault:focus-search')), 0);
+      } else if (e.key === 'n' && isUnlocked && currentOrg && currentOrg.role !== 'read_only') {
         navigate('/secrets/new');
-      } else if ((e.metaKey || e.ctrlKey) && e.key === 'l') {
-        e.preventDefault();
+      } else if (e.key === 'l' && isUnlocked) {
         lock();
       }
     };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [navigate, lock, isUnlocked, currentOrg, location.pathname]);
 
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [navigate, lock]);
-
-  const handleLogout = () => {
+  const handleLogout = async () => {
     lock();
-    logout();
+    await logout();
     navigate('/login');
   };
 
-  const handleOrgChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const orgId = e.target.value;
-    if (orgId) {
-      selectOrg(orgId);
-    }
-  };
-
-  const isActive = (path: string) => location.pathname === path;
-
-  // Announce page changes for screen readers
-  useEffect(() => {
-    const pageTitle = document.title || 'CloudVault';
-    const announcement = `Navigated to ${pageTitle}`;
-    let liveRegion = document.getElementById('route-announcer');
-    if (!liveRegion) {
-      liveRegion = document.createElement('div');
-      liveRegion.id = 'route-announcer';
-      liveRegion.setAttribute('role', 'status');
-      liveRegion.setAttribute('aria-live', 'polite');
-      liveRegion.setAttribute('aria-atomic', 'true');
-      liveRegion.className = 'sr-only';
-      document.body.appendChild(liveRegion);
-    }
-    liveRegion.textContent = announcement;
-  }, [location.pathname]);
-
-  const navLinks = [
-    { path: '/', label: 'Passwords', adminOnly: false },
-    { path: '/import-export', label: 'Import/Export', adminOnly: false },
-    { path: '/health', label: 'Health', adminOnly: true },
-    { path: '/users', label: 'Users', adminOnly: true },
-    { path: '/audit', label: 'Audit Log', adminOnly: true },
-    { path: '/settings', label: 'Settings', adminOnly: true },
-  ];
-
-  const visibleLinks = navLinks.filter(
-    (link) => !link.adminOnly || currentOrg?.role === 'admin'
-  );
+  const isAdmin = currentOrg?.role === 'admin';
+  const links = NAV.filter((l) => !l.adminOnly || isAdmin);
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
-      {/* Skip Link for Keyboard Navigation */}
       <SkipLink targetId="main-content" />
-      
-      {/* Header */}
-      <header className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex justify-between items-center h-16">
-            {/* Logo */}
-            <Link to="/" className="flex items-center space-x-2" aria-label="CloudVault Home">
-              <svg
-                className="h-8 w-8 text-vault-600"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-                <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-                <circle cx="12" cy="16" r="1" />
-              </svg>
-              <span className="text-xl font-bold text-gray-900 dark:text-gray-100">CloudVault</span>
-            </Link>
+      <header className="border-b border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800">
+        <div className="mx-auto flex h-16 max-w-7xl items-center gap-4 px-4 sm:px-6 lg:px-8">
+          <Link to="/" className="flex items-center gap-2 font-semibold text-gray-900 dark:text-white">
+            <LockIcon className="h-7 w-7 text-vault-600" />
+            <span className="hidden sm:inline">CloudVault</span>
+          </Link>
 
-            {/* Organization Selector - Desktop */}
-            {organizations.length > 0 && isUnlocked && (
-              <div className="hidden sm:block">
-                <label htmlFor="org-selector" className="sr-only">Select Organization</label>
-                <select
-                  id="org-selector"
-                  value={currentOrg?.id || ''}
-                  onChange={handleOrgChange}
-                  className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-vault-500"
+          {isUnlocked && currentOrg && (
+            <nav className="hidden flex-1 items-center gap-1 lg:flex" aria-label="Main">
+              {links.map((l) => (
+                <NavLink
+                  key={l.path}
+                  to={l.path}
+                  end={l.path === '/'}
+                  className={({ isActive }) =>
+                    cx(
+                      'rounded-md px-3 py-2 text-sm font-medium',
+                      isActive ? 'bg-vault-50 text-vault-700 dark:bg-vault-900/40 dark:text-vault-200' : 'text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700'
+                    )
+                  }
                 >
-                  <option value="">Select Organization</option>
-                  {organizations.map((org) => (
-                    <option key={org.id} value={org.id}>
-                      {org.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
+                  {l.label}
+                </NavLink>
+              ))}
+            </nav>
+          )}
+          <div className="flex-1 lg:hidden" />
+
+          <div className="flex items-center gap-2">
+            {isUnlocked && organizations.length > 1 && (
+              <select
+                aria-label="Organization"
+                value={currentOrg?.id ?? ''}
+                onChange={(e) => void selectOrg(e.target.value)}
+                className="max-w-[10rem] rounded-md border border-gray-300 bg-white py-1.5 pl-2 pr-8 text-sm dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100"
+              >
+                {organizations.map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {o.name}
+                  </option>
+                ))}
+              </select>
             )}
-
-            {/* Desktop User Menu */}
-            <div className="hidden sm:flex items-center space-x-4">
-              <ThemeToggle />
-              <Link
-                to="/preferences"
-                className="text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200"
-                title="Preferences"
-              >
-                {user?.email}
-              </Link>
-              {isUnlocked && (
-                <button
-                  onClick={lock}
-                  className="text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
-                  aria-label="Lock vault"
-                  title="Lock vault (Ctrl+L)"
-                >
-                  Lock
-                </button>
-              )}
+            {isUnlocked && (
               <button
-                onClick={handleLogout}
-                className="text-sm text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300"
-                aria-label="Sign out"
+                onClick={lock}
+                className="rounded-md px-3 py-1.5 text-sm font-medium text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700"
+                title="Lock vault (l)"
               >
-                Logout
+                Lock
               </button>
-            </div>
-
-            {/* Mobile Menu Button */}
-            <div className="flex sm:hidden items-center space-x-2">
-              <ThemeToggle />
+            )}
+            <ThemeToggle />
+            <div className="relative">
               <button
-                onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-                className="p-2 rounded-lg text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700"
-                aria-expanded={mobileMenuOpen}
-                aria-controls="mobile-menu"
-                aria-label={mobileMenuOpen ? 'Close menu' : 'Open menu'}
+                onClick={() => setMenuOpen((o) => !o)}
+                aria-expanded={menuOpen}
+                aria-haspopup="menu"
+                className="flex h-9 w-9 items-center justify-center rounded-full bg-vault-100 text-sm font-semibold text-vault-700 dark:bg-vault-900 dark:text-vault-200"
+                aria-label="Account menu"
               >
-                {mobileMenuOpen ? (
-                  <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                ) : (
-                  <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
-                  </svg>
-                )}
+                {(user?.name || user?.email || '?').charAt(0).toUpperCase()}
               </button>
-            </div>
-          </div>
-        </div>
-
-        {/* Mobile Menu */}
-        {mobileMenuOpen && (
-          <div 
-            id="mobile-menu" 
-            className="sm:hidden border-t border-gray-200 dark:border-gray-700"
-          >
-            <div className="px-4 py-3 space-y-3">
-              {/* Organization Selector - Mobile */}
-              {organizations.length > 0 && isUnlocked && (
-                <div>
-                  <label htmlFor="org-selector-mobile" className="sr-only">Select Organization</label>
-                  <select
-                    id="org-selector-mobile"
-                    value={currentOrg?.id || ''}
-                    onChange={handleOrgChange}
-                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-vault-500"
-                  >
-                    <option value="">Select Organization</option>
-                    {organizations.map((org) => (
-                      <option key={org.id} value={org.id}>
-                        {org.name}
-                      </option>
+              {menuOpen && (
+                <div role="menu" className="absolute right-0 z-40 mt-2 w-60 rounded-lg border border-gray-200 bg-white py-1 shadow-lg dark:border-gray-700 dark:bg-gray-800">
+                  <div className="border-b border-gray-100 px-4 py-2 text-sm dark:border-gray-700">
+                    <p className="truncate font-medium text-gray-900 dark:text-white">{user?.name || user?.email}</p>
+                    {currentOrg && (
+                      <p className="truncate text-xs text-gray-500 dark:text-gray-400">
+                        {currentOrg.name} ({currentOrg.role.replace('_', '-')})
+                      </p>
+                    )}
+                  </div>
+                  {isUnlocked &&
+                    links.map((l) => (
+                      <Link key={l.path} role="menuitem" to={l.path} className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 dark:text-gray-200 dark:hover:bg-gray-700 lg:hidden">
+                        {l.label}
+                      </Link>
                     ))}
-                  </select>
+                  <Link role="menuitem" to="/preferences" className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 dark:text-gray-200 dark:hover:bg-gray-700">
+                    Preferences and security
+                  </Link>
+                  <Link role="menuitem" to="/emergency" className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 dark:text-gray-200 dark:hover:bg-gray-700">
+                    Emergency access
+                  </Link>
+                  <button role="menuitem" onClick={() => void handleLogout()} className="block w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-gray-50 dark:text-red-400 dark:hover:bg-gray-700">
+                    Sign out
+                  </button>
                 </div>
               )}
-
-              {/* Navigation Links - Mobile */}
-              {currentOrg && isUnlocked && (
-                <nav className="space-y-1" aria-label="Mobile navigation">
-                  {visibleLinks.map((link) => (
-                    <Link
-                      key={link.path}
-                      to={link.path}
-                      className={`block px-3 py-2 rounded-lg text-sm font-medium ${
-                        isActive(link.path)
-                          ? 'bg-vault-50 dark:bg-vault-900/20 text-vault-600 dark:text-vault-400'
-                          : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'
-                      }`}
-                      aria-current={isActive(link.path) ? 'page' : undefined}
-                    >
-                      {link.label}
-                    </Link>
-                  ))}
-                </nav>
-              )}
-
-              {/* User Actions - Mobile */}
-              <div className="border-t border-gray-200 dark:border-gray-700 pt-3 space-y-2">
-                <Link
-                  to="/preferences"
-                  className="block px-3 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg"
-                >
-                  Preferences ({user?.email})
-                </Link>
-                {isUnlocked && (
-                  <button
-                    onClick={lock}
-                    className="w-full text-left px-3 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg"
-                  >
-                    Lock Vault
-                  </button>
-                )}
-                <button
-                  onClick={handleLogout}
-                  className="w-full text-left px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg"
-                >
-                  Logout
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-      </header>
-
-      {/* Desktop Navigation */}
-      {currentOrg && isUnlocked && (
-        <nav className="hidden sm:block bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700" aria-label="Main navigation">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div className="flex space-x-8 h-12">
-              {visibleLinks.map((link) => (
-                <Link
-                  key={link.path}
-                  to={link.path}
-                  className={`inline-flex items-center border-b-2 px-1 text-sm font-medium transition-colors ${
-                    isActive(link.path)
-                      ? 'border-vault-500 text-vault-600 dark:text-vault-400'
-                      : 'border-transparent text-gray-500 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-600 hover:text-gray-700 dark:hover:text-gray-200'
-                  }`}
-                  aria-current={isActive(link.path) ? 'page' : undefined}
-                >
-                  {link.label}
-                </Link>
-              ))}
-            </div>
-          </div>
-        </nav>
-      )}
-
-      {/* Keyboard Shortcuts Help (hidden, shown in footer) */}
-      <div className="sr-only" aria-hidden="true">
-        Keyboard shortcuts: Ctrl+K to search, Ctrl+N to create new, Ctrl+L to lock
-      </div>
-
-      {/* Main Content */}
-      <main id="main-content" className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8" tabIndex={-1}>
-        {children}
-      </main>
-
-      {/* Footer with Keyboard Shortcuts */}
-      <footer className="hidden sm:block border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3">
-          <div className="flex justify-between items-center text-xs text-gray-500 dark:text-gray-400">
-            <span>&copy; {new Date().getFullYear()} CloudVault</span>
-            <div className="flex space-x-4">
-              <span className="hidden lg:inline">
-                <kbd className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs">⌘K</kbd> Search
-              </span>
-              <span className="hidden lg:inline">
-                <kbd className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs">⌘N</kbd> New
-              </span>
-              <span className="hidden lg:inline">
-                <kbd className="px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs">⌘L</kbd> Lock
-              </span>
             </div>
           </div>
         </div>
-      </footer>
+      </header>
+
+      <main id="main-content" className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8" tabIndex={-1}>
+        {children}
+      </main>
     </div>
   );
 }

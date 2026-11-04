@@ -1,140 +1,77 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { AuthProvider, useAuth } from './lib/auth'
-import { VaultProvider } from './hooks/useVault'
-import { ToastProvider } from './components/ui/Toast'
-import { ThemeProvider } from './components/ui/ThemeProvider'
-import LoginForm from './components/auth/LoginForm'
-import MasterPasswordSetup from './components/auth/MasterPasswordSetup'
-import GithubCallback from './components/auth/GithubCallback'
-import SecretList from './components/vault/SecretList'
-import SecretForm from './components/vault/SecretForm'
-import ImportExport from './components/vault/ImportExport'
-import UserPreferences from './components/settings/UserPreferences'
-import AuditLog from './components/admin/AuditLog'
-import UserManagement from './components/admin/UserManagement'
-import HealthDashboard from './components/admin/HealthDashboard'
-import OrgSettings from './components/admin/OrgSettings'
-import Layout from './components/ui/Layout'
-import ErrorBoundary from './components/ui/ErrorBoundary'
-import NotFound from './components/ui/NotFound'
+import { useEffect, type ReactNode } from 'react';
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { AuthProvider, useAuth } from './lib/auth';
+import { PreferencesProvider, usePreferences } from './lib/preferences';
+import { VaultProvider } from './hooks/useVault';
+import { ToastProvider } from './components/ui/Toast';
+import { ThemeProvider, useTheme } from './components/ui/ThemeProvider';
+import ErrorBoundary from './components/ui/ErrorBoundary';
+import Layout from './components/ui/Layout';
+import NotFound from './components/ui/NotFound';
+import { FullPageSpinner } from './components/ui/kit';
+import LoginForm from './components/auth/LoginForm';
+import GithubCallback from './components/auth/GithubCallback';
+import MagicLinkVerify from './components/auth/MagicLinkVerify';
+import MasterPasswordSetup from './components/auth/MasterPasswordSetup';
+import VaultGate from './components/vault/VaultGate';
+import SecretList from './components/vault/SecretList';
+import SecretForm from './components/vault/SecretForm';
+import ImportExport from './components/vault/ImportExport';
+import SharedSecretPage from './components/share/SharedSecretPage';
+import EmergencyAccessPage from './components/emergency/EmergencyAccessPage';
+import UserPreferences from './components/settings/UserPreferences';
+import AuditLog from './components/admin/AuditLog';
+import UserManagement from './components/admin/UserManagement';
+import HealthDashboard from './components/admin/HealthDashboard';
+import OrgSettings from './components/admin/OrgSettings';
 
-function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { user, isLoading } = useAuth()
-  
-  if (isLoading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-vault-600"></div>
-      </div>
-    )
-  }
-  
-  if (!user) {
-    return <Navigate to="/login" replace />
-  }
-  
-  return <>{children}</>
+/** Signed in with keys set up; renders inside the app shell. */
+function Protected({ children, vault = false, adminOnly = false }: { children: ReactNode; vault?: boolean; adminOnly?: boolean }) {
+  const { user, isLoading, needsKeySetup } = useAuth();
+  if (isLoading) return <FullPageSpinner />;
+  if (!user) return <Navigate to="/login" replace />;
+  if (needsKeySetup) return <Navigate to="/setup" replace />;
+  return <Layout>{vault ? <VaultGate adminOnly={adminOnly}>{children}</VaultGate> : children}</Layout>;
+}
+
+/** Apply the saved theme preference once it loads. */
+function ThemeSync() {
+  const { preferences, isLoaded } = usePreferences();
+  const { setTheme } = useTheme();
+  useEffect(() => {
+    if (isLoaded) setTheme(preferences.theme);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoaded, preferences.theme]);
+  return null;
 }
 
 function AppRoutes() {
   return (
     <Routes>
+      {/* Public */}
       <Route path="/login" element={<LoginForm />} />
       <Route path="/auth/github/callback" element={<GithubCallback />} />
+      <Route path="/auth/magic-link" element={<MagicLinkVerify />} />
+      <Route path="/share/:linkId" element={<SharedSecretPage />} />
       <Route path="/setup" element={<MasterPasswordSetup />} />
-      <Route
-        path="/"
-        element={
-          <ProtectedRoute>
-            <Layout>
-              <SecretList />
-            </Layout>
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/secrets/new"
-        element={
-          <ProtectedRoute>
-            <Layout>
-              <SecretForm />
-            </Layout>
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/secrets/:id/edit"
-        element={
-          <ProtectedRoute>
-            <Layout>
-              <SecretForm />
-            </Layout>
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/audit"
-        element={
-          <ProtectedRoute>
-            <Layout>
-              <AuditLog />
-            </Layout>
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/users"
-        element={
-          <ProtectedRoute>
-            <Layout>
-              <UserManagement />
-            </Layout>
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/health"
-        element={
-          <ProtectedRoute>
-            <Layout>
-              <HealthDashboard />
-            </Layout>
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/settings"
-        element={
-          <ProtectedRoute>
-            <Layout>
-              <OrgSettings />
-            </Layout>
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/import-export"
-        element={
-          <ProtectedRoute>
-            <Layout>
-              <ImportExport />
-            </Layout>
-          </ProtectedRoute>
-        }
-      />
-      <Route
-        path="/preferences"
-        element={
-          <ProtectedRoute>
-            <Layout>
-              <UserPreferences />
-            </Layout>
-          </ProtectedRoute>
-        }
-      />
+
+      {/* Vault */}
+      <Route path="/" element={<Protected vault><SecretList /></Protected>} />
+      <Route path="/secrets/new" element={<Protected vault><SecretForm /></Protected>} />
+      <Route path="/secrets/:id/edit" element={<Protected vault><SecretForm /></Protected>} />
+      <Route path="/import-export" element={<Protected vault><ImportExport /></Protected>} />
+      <Route path="/health" element={<Protected vault><HealthDashboard /></Protected>} />
+      <Route path="/users" element={<Protected vault adminOnly><UserManagement /></Protected>} />
+      <Route path="/audit" element={<Protected vault adminOnly><AuditLog /></Protected>} />
+      <Route path="/settings" element={<Protected vault adminOnly><OrgSettings /></Protected>} />
+
+      {/* Account */}
+      <Route path="/preferences" element={<Protected><UserPreferences /></Protected>} />
+      <Route path="/emergency" element={<Protected><EmergencyAccessPage /></Protected>} />
+
       <Route path="*" element={<NotFound />} />
     </Routes>
-  )
+  );
 }
 
 export default function App() {
@@ -144,13 +81,16 @@ export default function App() {
         <ToastProvider>
           <BrowserRouter>
             <AuthProvider>
-              <VaultProvider>
-                <AppRoutes />
-              </VaultProvider>
+              <PreferencesProvider>
+                <ThemeSync />
+                <VaultProvider>
+                  <AppRoutes />
+                </VaultProvider>
+              </PreferencesProvider>
             </AuthProvider>
           </BrowserRouter>
         </ToastProvider>
       </ThemeProvider>
     </ErrorBoundary>
-  )
+  );
 }

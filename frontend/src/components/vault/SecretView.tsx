@@ -1,552 +1,344 @@
 /**
- * Secret View Modal
- * 
- * Displays decrypted secret details with copy functionality.
- * Supports favorites toggle, TOTP display, share links, and version history.
- * 
- * @module components/vault/SecretView
+ * Secret detail view: decrypted fields with reveal and copy, TOTP codes,
+ * version history (decrypted locally, with restore) and share links.
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useVault } from '../../hooks/useVault';
-import { secretsApi, type Secret, type SecretHistory } from '../../lib/api';
+import { useVault, type OpenedSecret } from '../../hooks/useVault';
+import { useClipboard } from '../../hooks/useClipboard';
+import { secretsApi, sharingApi, type SecretHistory, type ShareLink } from '../../lib/api';
+import type { SecretPayload } from '../../lib/crypto';
 import { useToast } from '../ui/Toast';
+import { Alert, Badge, Button, Modal, Spinner, cx, errorMessage } from '../ui/kit';
 import TOTPDisplay from './TOTPDisplay';
 import ShareModal from './ShareModal';
+import { SECRET_TYPE_LABELS, expiryBadge } from './SecretList';
 
-/**
- * Props for SecretView component
- */
-interface SecretViewProps {
-  /** Secret ID to display */
-  secretId: string;
-  /** Callback when modal is closed */
-  onClose: () => void;
+function safeHref(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null;
+  } catch {
+    return null;
+  }
 }
 
-/**
- * Decrypted secret data structure
- */
-interface DecryptedData {
-  username: string;
-  password: string;
-  notes?: string;
-  totpSecret?: string;
-  totpIssuer?: string;
+export function FieldRow({ label, value, secret = false, mono = false, copyKey }: { label: string; value?: string; secret?: boolean; mono?: boolean; copyKey: string }) {
+  const [revealed, setRevealed] = useState(false);
+  const { copy, copiedKey } = useClipboard();
+  if (!value) return null;
+  const shown = secret && !revealed ? '•'.repeat(Math.min(value.length, 16)) : value;
+  return (
+    <div className="py-2">
+      <dt className="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">{label}</dt>
+      <dd className="mt-1 flex items-start gap-2">
+        <span className={cx('min-w-0 flex-1 break-all text-sm text-gray-900 dark:text-gray-100', (mono || secret) && 'font-mono')}>{shown}</span>
+        {secret && (
+          <Button variant="ghost" size="sm" onClick={() => setRevealed((r) => !r)} aria-label={revealed ? `Hide ${label}` : `Show ${label}`}>
+            {revealed ? 'Hide' : 'Show'}
+          </Button>
+        )}
+        <Button variant="ghost" size="sm" onClick={() => void copy(value, copyKey)} aria-label={`Copy ${label}`}>
+          {copiedKey === copyKey ? 'Copied' : 'Copy'}
+        </Button>
+      </dd>
+    </div>
+  );
 }
 
-/**
- * Available tabs in the secret view
- */
-type ViewTab = 'details' | 'history';
+export function PayloadFields({ payload, prefix = '' }: { payload: SecretPayload; prefix?: string }) {
+  return (
+    <dl className="divide-y divide-gray-100 dark:divide-gray-700">
+      <FieldRow label="Username" value={payload.username} copyKey={`${prefix}username`} />
+      <FieldRow label="Password" value={payload.password} secret copyKey={`${prefix}password`} />
+      <FieldRow label="API key" value={payload.apiKey} secret copyKey={`${prefix}apikey`} />
+      {payload.card && (
+        <>
+          <FieldRow label="Cardholder" value={payload.card.holder} copyKey={`${prefix}holder`} />
+          <FieldRow label="Card number" value={payload.card.number} secret mono copyKey={`${prefix}number`} />
+          <FieldRow label="Expiry" value={payload.card.expiry} copyKey={`${prefix}expiry`} />
+          <FieldRow label="Security code" value={payload.card.cvv} secret copyKey={`${prefix}cvv`} />
+          <FieldRow label="PIN" value={payload.card.pin} secret copyKey={`${prefix}pin`} />
+        </>
+      )}
+      {payload.customFields?.map((f, i) => (
+        <FieldRow key={i} label={f.label} value={f.value} secret={f.hidden} copyKey={`${prefix}custom${i}`} />
+      ))}
+      {payload.notes && (
+        <div className="py-2">
+          <dt className="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">Notes</dt>
+          <dd className="mt-1 whitespace-pre-wrap break-words text-sm text-gray-900 dark:text-gray-100">{payload.notes}</dd>
+        </div>
+      )}
+    </dl>
+  );
+}
 
-export default function SecretView({ secretId, onClose }: SecretViewProps) {
-  const { secrets, currentOrg, decryptSecretData, deleteSecret, loadSecrets } = useVault();
+type Tab = 'details' | 'history' | 'sharing';
+
+export default function SecretView({ secretId, onClose }: { secretId: string; onClose: () => void }) {
+  const { currentOrg, openSecret, decryptRecord, deleteSecret, updateSecret } = useVault();
   const navigate = useNavigate();
-  const { success, error: showError } = useToast();
-  
-  const [decryptedData, setDecryptedData] = useState<DecryptedData | null>(null);
-  const [showPassword, setShowPassword] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
+  const toast = useToast();
+
+  const [opened, setOpened] = useState<OpenedSecret | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState<'username' | 'password' | 'totp' | null>(null);
-  const [isDeleting, setIsDeleting] = useState(false);
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-  const [isFavoriteLoading, setIsFavoriteLoading] = useState(false);
-  const [showShareModal, setShowShareModal] = useState(false);
-  const [activeTab, setActiveTab] = useState<ViewTab>('details');
-  const [history, setHistory] = useState<SecretHistory[]>([]);
-  const [isHistoryLoading, setIsHistoryLoading] = useState(false);
+  const [tab, setTab] = useState<Tab>('details');
+  const [history, setHistory] = useState<Array<SecretHistory & { payload: SecretPayload | null }> | null>(null);
+  const [shares, setShares] = useState<ShareLink[] | null>(null);
+  const [showShare, setShowShare] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [busy, setBusy] = useState(false);
 
-  const secret = secrets.find((s) => s.id === secretId);
+  const load = useCallback(() => {
+    setError(null);
+    openSecret(secretId)
+      .then(setOpened)
+      .catch((err) => setError(errorMessage(err, 'Could not decrypt this item')));
+  }, [openSecret, secretId]);
+  useEffect(load, [load]);
 
-  useEffect(() => {
-    if (!secret) {
-      setError('Secret not found');
-      setIsLoading(false);
-      return;
-    }
-
-    decryptSecretData(secret)
-      .then((data) => {
-        setDecryptedData(data);
-        setIsLoading(false);
-      })
-      .catch((err) => {
-        setError(err.message || 'Failed to decrypt secret');
-        setIsLoading(false);
-      });
-  }, [secret, decryptSecretData]);
-
-  /**
-   * Load secret history when history tab is selected
-   */
   const loadHistory = useCallback(async () => {
-    if (!currentOrg || !secret) return;
-    
-    setIsHistoryLoading(true);
+    if (!currentOrg) return;
     try {
-      const data = await secretsApi.getHistory(currentOrg.id, secretId);
-      setHistory(data);
+      const entries = await secretsApi.getHistory(currentOrg.id, secretId);
+      const decrypted = await Promise.all(
+        entries.map(async (h) => ({ ...h, payload: await decryptRecord(secretId, h).catch(() => null) }))
+      );
+      setHistory(decrypted);
     } catch (err) {
-      showError('Failed to load history');
-    } finally {
-      setIsHistoryLoading(false);
+      toast.error('Could not load history', errorMessage(err));
+      setHistory([]);
     }
-  }, [currentOrg, secret, secretId, showError]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentOrg, secretId, decryptRecord]);
+
+  const loadShares = useCallback(async () => {
+    if (!currentOrg) return;
+    setShares(await sharingApi.list(currentOrg.id, secretId).catch(() => []));
+  }, [currentOrg, secretId]);
 
   useEffect(() => {
-    if (activeTab === 'history' && history.length === 0 && !isHistoryLoading) {
-      loadHistory();
-    }
-  }, [activeTab, history.length, isHistoryLoading, loadHistory]);
+    if (tab === 'history' && history === null) void loadHistory();
+    if (tab === 'sharing' && shares === null) void loadShares();
+  }, [tab, history, shares, loadHistory, loadShares]);
 
-  /**
-   * Copy text to clipboard
-   */
-  const copyToClipboard = async (text: string, type: 'username' | 'password' | 'totp') => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(type);
-      setTimeout(() => setCopied(null), 2000);
-    } catch (err) {
-      console.error('Failed to copy:', err);
-    }
-  };
+  const canWrite = currentOrg?.role !== 'read_only';
 
-  /**
-   * Toggle favorite status
-   */
-  const handleToggleFavorite = async () => {
-    if (!currentOrg || !secret) return;
-    
-    setIsFavoriteLoading(true);
-    try {
-      await secretsApi.toggleFavorite(currentOrg.id, secretId, !secret.isFavorite);
-      await loadSecrets();
-      success(secret.isFavorite ? 'Removed from favorites' : 'Added to favorites');
-    } catch (err) {
-      showError('Failed to update favorite');
-    } finally {
-      setIsFavoriteLoading(false);
-    }
-  };
-
-  /**
-   * Delete the secret
-   */
   const handleDelete = async () => {
-    setIsDeleting(true);
+    setBusy(true);
     try {
       await deleteSecret(secretId);
-      success('Secret deleted');
+      toast.success('Item deleted');
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to delete secret');
-    } finally {
-      setIsDeleting(false);
+      toast.error('Could not delete', errorMessage(err));
+      setBusy(false);
     }
   };
 
-  /**
-   * Navigate to edit page
-   */
-  const handleEdit = () => {
-    navigate(`/secrets/${secretId}/edit`);
+  const handleRestore = async (entry: SecretHistory & { payload: SecretPayload | null }) => {
+    if (!entry.payload || !opened) return;
+    setBusy(true);
+    try {
+      await updateSecret(secretId, {}, entry.payload, opened.secret.version);
+      toast.success(`Restored version ${entry.version}`);
+      setHistory(null);
+      setTab('details');
+      load();
+    } catch (err) {
+      toast.error('Could not restore', errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
   };
 
+  const handleRevoke = async (linkId: string) => {
+    if (!currentOrg) return;
+    try {
+      await sharingApi.revoke(currentOrg.id, linkId);
+      toast.success('Share link revoked');
+      void loadShares();
+    } catch (err) {
+      toast.error('Could not revoke', errorMessage(err));
+    }
+  };
+
+  const secret = opened?.secret;
+  const payload = opened?.payload;
+  const href = safeHref(secret?.url ?? null);
+
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto">
-      <div className="flex min-h-screen items-center justify-center p-4">
-        {/* Backdrop */}
-        <div
-          className="fixed inset-0 bg-black bg-opacity-30 transition-opacity"
-          onClick={onClose}
-        />
-
-        {/* Modal */}
-        <div 
-          className="relative bg-white dark:bg-gray-800 rounded-xl shadow-xl max-w-lg w-full p-6"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="secret-view-title"
-        >
-          {/* Close button */}
-          <button
-            onClick={onClose}
-            className="absolute top-4 right-4 text-gray-400 hover:text-gray-500 dark:hover:text-gray-300"
-            aria-label="Close"
-          >
-            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
-
-          {isLoading && (
-            <div className="py-12 text-center">
-              <svg
-                className="animate-spin mx-auto h-8 w-8 text-vault-600"
-                fill="none"
-                viewBox="0 0 24 24"
-              >
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-              <p className="mt-2 text-gray-500">Decrypting...</p>
-            </div>
-          )}
-
-          {error && (
-            <div className="py-8 text-center">
-              <p className="text-red-600">{error}</p>
-              <button
-                onClick={onClose}
-                className="mt-4 text-vault-600 hover:text-vault-700"
-              >
-                Close
-              </button>
-            </div>
-          )}
-
-          {!isLoading && !error && secret && decryptedData && (
+    <>
+      <Modal
+        title={secret?.name ?? 'Loading...'}
+        onClose={onClose}
+        size="lg"
+        footer={
+          secret &&
+          canWrite && (
             <>
-              {/* Header */}
-              <div className="flex items-center justify-between mb-6">
-                <div className="flex items-center space-x-4">
-                  <div className="w-12 h-12 bg-vault-100 dark:bg-vault-900 rounded-lg flex items-center justify-center">
-                    <span className="text-vault-600 dark:text-vault-400 font-bold text-xl">
-                      {secret.name.charAt(0).toUpperCase()}
-                    </span>
-                  </div>
-                  <div>
-                    <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100">{secret.name}</h2>
-                    {secret.url && (
-                      <a
-                        href={secret.url.startsWith('http') ? secret.url : `https://${secret.url}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-sm text-vault-600 dark:text-vault-400 hover:underline"
-                      >
-                        {secret.url}
-                      </a>
-                    )}
-                  </div>
-                </div>
-                {/* Favorite & Share buttons */}
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={handleToggleFavorite}
-                    disabled={isFavoriteLoading}
-                    className={`p-2 rounded-lg transition-colors ${
-                      secret.isFavorite
-                        ? 'text-yellow-500 hover:text-yellow-600'
-                        : 'text-gray-400 hover:text-gray-500 dark:hover:text-gray-300'
-                    }`}
-                    title={secret.isFavorite ? 'Remove from favorites' : 'Add to favorites'}
-                  >
-                    <svg className="w-5 h-5" fill={secret.isFavorite ? 'currentColor' : 'none'} viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z" />
-                    </svg>
-                  </button>
-                  <button
-                    onClick={() => setShowShareModal(true)}
-                    className="p-2 rounded-lg text-gray-400 hover:text-gray-500 dark:hover:text-gray-300 transition-colors"
-                    title="Share"
-                  >
-                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
-                    </svg>
-                  </button>
-                </div>
-              </div>
-
-              {/* Tabs */}
-              <div className="flex border-b border-gray-200 dark:border-gray-700 mb-4">
-                <button
-                  onClick={() => setActiveTab('details')}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-                    activeTab === 'details'
-                      ? 'border-vault-500 text-vault-600 dark:text-vault-400'
-                      : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300'
-                  }`}
-                >
-                  Details
-                </button>
-                <button
-                  onClick={() => setActiveTab('history')}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-                    activeTab === 'history'
-                      ? 'border-vault-500 text-vault-600 dark:text-vault-400'
-                      : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300'
-                  }`}
-                >
-                  History
-                </button>
-              </div>
-
-              {/* Details Tab */}
-              {activeTab === 'details' && (
-                <div className="space-y-4">
-                  {/* TOTP Display (for TOTP secrets) */}
-                  {secret.secretType === 'totp' && decryptedData.totpSecret && (
-                    <TOTPDisplay
-                      secret={decryptedData.totpSecret}
-                      issuer={decryptedData.totpIssuer || secret.name}
-                      accountName={decryptedData.username}
-                      onCopy={(code) => copyToClipboard(code, 'totp')}
-                    />
-                  )}
-
-                  {/* Username */}
-                  {decryptedData.username && (
-                    <div>
-                      <label className="block text-sm font-medium text-gray-500 dark:text-gray-400 mb-1">
-                        Username / Email
-                      </label>
-                      <div className="flex items-center space-x-2">
-                        <input
-                          type="text"
-                          readOnly
-                          value={decryptedData.username}
-                          className="flex-1 px-3 py-2 bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-lg text-gray-900 dark:text-gray-100"
-                        />
-                        <button
-                          onClick={() => copyToClipboard(decryptedData.username, 'username')}
-                          className={`p-2 rounded-lg border transition-colors ${
-                            copied === 'username'
-                              ? 'bg-green-50 dark:bg-green-900 border-green-200 dark:border-green-700 text-green-600 dark:text-green-400'
-                              : 'border-gray-200 dark:border-gray-600 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:border-gray-300'
-                          }`}
-                          title="Copy username"
-                        >
-                          {copied === 'username' ? (
-                            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                            </svg>
-                          ) : (
-                            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
-                            </svg>
-                          )}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Password (not shown for TOTP-only secrets) */}
-                  {decryptedData.password && secret.secretType !== 'totp' && (
-                    <div>
-                      <label className="block text-sm font-medium text-gray-500 dark:text-gray-400 mb-1">
-                        Password
-                      </label>
-                      <div className="flex items-center space-x-2">
-                        <input
-                          type={showPassword ? 'text' : 'password'}
-                          readOnly
-                          value={decryptedData.password}
-                          className="flex-1 px-3 py-2 bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-lg text-gray-900 dark:text-gray-100 font-mono"
-                        />
-                        <button
-                          onClick={() => setShowPassword(!showPassword)}
-                          className="p-2 rounded-lg border border-gray-200 dark:border-gray-600 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:border-gray-300"
-                          title={showPassword ? 'Hide password' : 'Show password'}
-                        >
-                          {showPassword ? (
-                            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
-                            </svg>
-                          ) : (
-                            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                            </svg>
-                          )}
-                        </button>
-                        <button
-                          onClick={() => copyToClipboard(decryptedData.password, 'password')}
-                          className={`p-2 rounded-lg border transition-colors ${
-                            copied === 'password'
-                              ? 'bg-green-50 dark:bg-green-900 border-green-200 dark:border-green-700 text-green-600 dark:text-green-400'
-                              : 'border-gray-200 dark:border-gray-600 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:border-gray-300'
-                          }`}
-                          title="Copy password"
-                        >
-                          {copied === 'password' ? (
-                            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                            </svg>
-                          ) : (
-                            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
-                            </svg>
-                          )}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Notes */}
-                  {decryptedData.notes && (
-                    <div>
-                      <label className="block text-sm font-medium text-gray-500 dark:text-gray-400 mb-1">
-                        Notes
-                      </label>
-                      <div className="px-3 py-2 bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600 rounded-lg text-gray-900 dark:text-gray-100 text-sm whitespace-pre-wrap">
-                        {decryptedData.notes}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Category & Tags */}
-                  {(secret.categoryName || secret.tags?.length > 0) && (
-                    <div className="flex flex-wrap gap-2">
-                      {secret.categoryName && (
-                        <span 
-                          className="px-2 py-1 text-xs rounded-full"
-                          style={{ 
-                            backgroundColor: (secret.categoryColor || '#6366f1') + '20',
-                            color: secret.categoryColor || '#6366f1'
-                          }}
-                        >
-                          {secret.categoryName}
-                        </span>
-                      )}
-                      {secret.tags?.map((tag) => (
-                        <span key={tag} className="px-2 py-1 text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 rounded-full">
-                          {tag}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* Meta */}
-                  <div className="pt-4 border-t border-gray-100 dark:border-gray-700 text-xs text-gray-400 dark:text-gray-500">
-                    <p>Version {secret.version} • Last updated {new Date(secret.updatedAt).toLocaleDateString()}</p>
-                    {secret.expiresAt && (
-                      <p className={new Date(secret.expiresAt) < new Date() ? 'text-red-500' : ''}>
-                        {new Date(secret.expiresAt) < new Date() ? 'Expired' : 'Expires'} {new Date(secret.expiresAt).toLocaleDateString()}
-                      </p>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {/* History Tab */}
-              {activeTab === 'history' && (
-                <div className="space-y-3">
-                  {isHistoryLoading ? (
-                    <div className="text-center py-8">
-                      <div className="animate-spin mx-auto w-6 h-6 border-2 border-vault-600 border-t-transparent rounded-full" />
-                      <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">Loading history...</p>
-                    </div>
-                  ) : history.length === 0 ? (
-                    <p className="text-center py-8 text-gray-500 dark:text-gray-400">No history available</p>
-                  ) : (
-                    history.map((entry, index) => (
-                      <div
-                        key={entry.id}
-                        className="p-3 rounded-lg bg-gray-50 dark:bg-gray-700 border border-gray-200 dark:border-gray-600"
-                      >
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <span className="text-sm font-medium text-gray-900 dark:text-gray-100">
-                              Version {entry.version}
-                            </span>
-                            {index === 0 && (
-                              <span className="px-2 py-0.5 text-xs bg-vault-100 dark:bg-vault-900 text-vault-600 dark:text-vault-400 rounded">
-                                Current
-                              </span>
-                            )}
-                          </div>
-                          <span className="text-xs text-gray-500 dark:text-gray-400">
-                            {new Date(entry.createdAt).toLocaleString()}
-                          </span>
-                        </div>
-                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                          Changed by {entry.changedByEmail}
-                        </p>
-                      </div>
-                    ))
-                  )}
-                </div>
-              )}
-
-              {/* Actions */}
-              <div className="mt-6 flex justify-between">
-                <button
-                  onClick={() => setShowDeleteConfirm(true)}
-                  className="text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 text-sm font-medium"
-                >
-                  Delete
-                </button>
-                <div className="space-x-3">
-                  <button
-                    onClick={onClose}
-                    className="px-4 py-2 text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600"
-                  >
-                    Close
-                  </button>
-                  <button
-                    onClick={handleEdit}
-                    className="px-4 py-2 text-white bg-vault-600 rounded-lg hover:bg-vault-700"
-                  >
-                    Edit
-                  </button>
-                </div>
-              </div>
-
-              {/* Delete Confirmation */}
-              {showDeleteConfirm && (
-                <div className="absolute inset-0 bg-white dark:bg-gray-800 rounded-xl p-6 flex flex-col items-center justify-center">
-                  <svg
-                    className="w-12 h-12 text-red-500 mb-4"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
-                    />
-                  </svg>
-                  <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-2">Delete this password?</h3>
-                  <p className="text-sm text-gray-500 dark:text-gray-400 text-center mb-6">
-                    This action cannot be undone. The password history will also be deleted.
-                  </p>
-                  <div className="flex space-x-3">
-                    <button
-                      onClick={() => setShowDeleteConfirm(false)}
-                      className="px-4 py-2 text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      onClick={handleDelete}
-                      disabled={isDeleting}
-                      className="px-4 py-2 text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-50"
-                    >
-                      {isDeleting ? 'Deleting...' : 'Delete'}
-                    </button>
-                  </div>
-                </div>
+              {confirmDelete ? (
+                <>
+                  <span className="mr-auto self-center text-sm text-red-600 dark:text-red-400">Delete this item and its history?</span>
+                  <Button variant="secondary" onClick={() => setConfirmDelete(false)}>
+                    Cancel
+                  </Button>
+                  <Button variant="danger" loading={busy} onClick={() => void handleDelete()}>
+                    Delete
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button variant="ghost" className="mr-auto text-red-600 dark:text-red-400" onClick={() => setConfirmDelete(true)}>
+                    Delete
+                  </Button>
+                  <Button variant="secondary" onClick={() => setShowShare(true)}>
+                    Share
+                  </Button>
+                  <Button onClick={() => navigate(`/secrets/${secretId}/edit`)}>Edit</Button>
+                </>
               )}
             </>
-          )}
-        </div>
-      </div>
+          )
+        }
+      >
+        {error && <Alert tone="error">{error}</Alert>}
+        {!error && !opened && (
+          <div className="flex justify-center py-10 text-vault-600">
+            <Spinner className="h-8 w-8" />
+          </div>
+        )}
 
-      {/* Share Modal */}
-      {showShareModal && secret && currentOrg && (
+        {secret && payload && (
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge color="blue">{SECRET_TYPE_LABELS[secret.secretType]}</Badge>
+              {secret.categoryName && <Badge>{secret.categoryName}</Badge>}
+              {secret.tags.map((t) => (
+                <Badge key={t} color="purple">
+                  {t}
+                </Badge>
+              ))}
+              {expiryBadge(secret.expiresAt)}
+            </div>
+
+            <div className="flex gap-4 border-b border-gray-200 text-sm dark:border-gray-700" role="tablist">
+              {(['details', 'history', 'sharing'] as Tab[]).map((t) => (
+                <button
+                  key={t}
+                  role="tab"
+                  aria-selected={tab === t}
+                  onClick={() => setTab(t)}
+                  className={cx(
+                    '-mb-px border-b-2 px-1 pb-2 font-medium capitalize',
+                    tab === t ? 'border-vault-600 text-vault-700 dark:text-vault-300' : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400'
+                  )}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+
+            {tab === 'details' && (
+              <div className="space-y-3">
+                {href && (
+                  <a href={href} target="_blank" rel="noopener noreferrer" className="block truncate text-sm text-vault-600 hover:underline">
+                    {secret.url}
+                  </a>
+                )}
+                {payload.totp && <TOTPDisplay value={payload.totp} />}
+                <PayloadFields payload={payload} />
+                <p className="text-xs text-gray-400">
+                  Version {secret.version}, updated {new Date(secret.updatedAt.replace(' ', 'T') + (secret.updatedAt.endsWith('Z') ? '' : 'Z')).toLocaleString()}
+                </p>
+              </div>
+            )}
+
+            {tab === 'history' && (
+              <div>
+                {history === null ? (
+                  <Spinner />
+                ) : history.length === 0 ? (
+                  <p className="text-sm text-gray-500">No earlier versions. The last 20 versions are kept when the contents change.</p>
+                ) : (
+                  <ul className="space-y-3">
+                    {history.map((h) => (
+                      <li key={h.id} className="rounded-lg border border-gray-200 p-3 dark:border-gray-700">
+                        <div className="mb-2 flex items-center justify-between text-sm">
+                          <span className="font-medium text-gray-900 dark:text-white">Version {h.version}</span>
+                          <span className="text-xs text-gray-500">
+                            {h.changedByEmail ?? 'unknown'} replaced it on {new Date(h.createdAt.replace(' ', 'T') + 'Z').toLocaleString()}
+                          </span>
+                        </div>
+                        {h.payload ? <PayloadFields payload={h.payload} prefix={`h${h.id}`} /> : <Alert tone="warning">This version could not be decrypted.</Alert>}
+                        {canWrite && h.payload && (
+                          <Button variant="secondary" size="sm" className="mt-2" loading={busy} onClick={() => void handleRestore(h)}>
+                            Restore this version
+                          </Button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+
+            {tab === 'sharing' && (
+              <div className="space-y-3">
+                <p className="text-sm text-gray-500 dark:text-gray-400">
+                  Share links give someone outside the vault temporary access to a copy of this item. The decryption key is part of
+                  the link and is never sent to the server.
+                </p>
+                {shares === null ? (
+                  <Spinner />
+                ) : shares.length === 0 ? (
+                  <p className="text-sm text-gray-500">No share links.</p>
+                ) : (
+                  <ul className="divide-y divide-gray-200 text-sm dark:divide-gray-700">
+                    {shares.map((l) => {
+                      const active = !l.isRevoked && !l.isExpired && !l.isExhausted;
+                      return (
+                        <li key={l.id} className="flex items-center gap-3 py-2">
+                          <div className="flex-1">
+                            <p className="text-gray-900 dark:text-gray-100">
+                              {l.recipientEmail ?? 'Anyone with the link'} {l.hasPassword && <Badge>password</Badge>}
+                            </p>
+                            <p className="text-xs text-gray-500">
+                              Viewed {l.viewCount}
+                              {l.maxViews > 0 ? ` of ${l.maxViews}` : ''} times, {active ? `expires ${new Date(l.expiresAt).toLocaleString()}` : l.isRevoked ? 'revoked' : l.isExpired ? 'expired' : 'used up'}
+                            </p>
+                          </div>
+                          {active && canWrite && (
+                            <Button variant="secondary" size="sm" onClick={() => void handleRevoke(l.id)}>
+                              Revoke
+                            </Button>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </Modal>
+
+      {showShare && secret && payload && currentOrg && (
         <ShareModal
+          orgId={currentOrg.id}
           secretId={secret.id}
           secretName={secret.name}
-          orgId={currentOrg.id}
-          onClose={() => setShowShareModal(false)}
+          payload={payload}
+          onClose={() => {
+            setShowShare(false);
+            setShares(null);
+          }}
         />
       )}
-    </div>
+    </>
   );
 }

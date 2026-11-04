@@ -1,335 +1,394 @@
 /**
- * Organization Settings Component
- * 
- * Configure organization-wide security policies and defaults.
+ * Organization settings (admins): policies, name, emergency access, key
+ * rotation, and leaving or deleting the organization.
  */
 
-import { useState, useEffect } from 'react';
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useVault } from '../../hooks/useVault';
+import { emergencyApi, orgSettingsApi, orgsApi, type EmergencyContact, type EmergencyRequest, type OrgSettings as Settings } from '../../lib/api';
+import { encryptOrgKeyFor, keyFingerprint } from '../../lib/crypto';
 import { useToast } from '../ui/Toast';
-import { Skeleton } from '../ui/Skeleton';
+import { Alert, Badge, Button, Card, Checkbox, Field, Fingerprint, Modal, PageHeader, Spinner, TextInput, errorMessage } from '../ui/kit';
+import KeyRotationDialog from './KeyRotationDialog';
 
-interface OrgSettings {
-  require2fa: boolean;
-  minPasswordLength: number;
-  passwordExpiryDays: number;
-  allowShareLinks: boolean;
-  shareLinkMaxHours: number;
-  allowEmergencyAccess: boolean;
-  emergencyWaitMinHours: number;
-  auditRetentionDays: number;
-}
-
-export default function OrgSettings() {
+function PolicyForm() {
   const { currentOrg } = useVault();
-  const { success, error } = useToast();
-  const [settings, setSettings] = useState<OrgSettings | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isSaving, setIsSaving] = useState(false);
+  const toast = useToast();
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (!currentOrg) return;
-    
-    const fetchSettings = async () => {
-      setIsLoading(true);
-      try {
-        const token = localStorage.getItem('cloudvault_token');
-        const response = await fetch(`/api/organizations/${currentOrg.id}/settings`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        
-        if (!response.ok) throw new Error('Failed to fetch settings');
-        
-        const data = await response.json();
-        setSettings(data);
-      } catch (err) {
-        error('Load Failed', (err as Error).message);
-      } finally {
-        setIsLoading(false);
-      }
-    };
+    if (currentOrg) orgSettingsApi.get(currentOrg.id).then(setSettings).catch(() => undefined);
+  }, [currentOrg]);
 
-    fetchSettings();
-  }, [currentOrg, error]);
+  if (!settings || !currentOrg) return <Spinner />;
+  const set = <K extends keyof Settings>(k: K, v: Settings[K]) => setSettings({ ...settings, [k]: v });
+  const num = (k: keyof Settings) => (e: React.ChangeEvent<HTMLInputElement>) => set(k, Number(e.target.value) as never);
 
-  const saveSettings = async () => {
-    if (!settings || !currentOrg) return;
-    
-    setIsSaving(true);
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
     try {
-      const token = localStorage.getItem('cloudvault_token');
-      const response = await fetch(`/api/organizations/${currentOrg.id}/settings`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify(settings),
-      });
-
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error || 'Failed to save settings');
-      }
-
-      const updated = await response.json();
-      setSettings(updated);
-      success('Settings Saved', 'Organization settings have been updated');
+      setSettings(await orgSettingsApi.update(currentOrg.id, settings));
+      toast.success('Settings saved');
     } catch (err) {
-      error('Save Failed', (err as Error).message);
+      toast.error('Could not save settings', errorMessage(err));
     } finally {
-      setIsSaving(false);
+      setSaving(false);
     }
   };
 
-  const updateSetting = <K extends keyof OrgSettings>(key: K, value: OrgSettings[K]) => {
-    if (!settings) return;
-    setSettings({ ...settings, [key]: value });
+  return (
+    <form onSubmit={save} className="space-y-5">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="Minimum generated password length" hint="Used by the password generator and form warnings.">
+          {(id) => <TextInput id={id} type="number" min={8} max={128} value={settings.minPasswordLength} onChange={num('minPasswordLength')} />}
+        </Field>
+        <Field label="Default expiry for new logins (days)" hint="0 means new logins do not expire.">
+          {(id) => <TextInput id={id} type="number" min={0} max={730} value={settings.passwordExpiryDays} onChange={num('passwordExpiryDays')} />}
+        </Field>
+        <Field label="Keep audit log for (days)" hint="Older entries are deleted by the daily cleanup.">
+          {(id) => <TextInput id={id} type="number" min={30} max={3650} value={settings.auditRetentionDays} onChange={num('auditRetentionDays')} />}
+        </Field>
+      </div>
+
+      <div className="space-y-3 border-t border-gray-200 pt-4 dark:border-gray-700">
+        <Checkbox label="Allow share links" checked={settings.allowShareLinks} onChange={(e) => set('allowShareLinks', e.target.checked)} />
+        {settings.allowShareLinks && (
+          <Field label="Longest share link (hours)">
+            {(id) => <TextInput id={id} type="number" min={1} max={720} value={settings.shareLinkMaxHours} onChange={num('shareLinkMaxHours')} className="max-w-xs" />}
+          </Field>
+        )}
+      </div>
+
+      <div className="space-y-3 border-t border-gray-200 pt-4 dark:border-gray-700">
+        <Checkbox label="Allow emergency access" checked={settings.allowEmergencyAccess} onChange={(e) => set('allowEmergencyAccess', e.target.checked)} />
+        {settings.allowEmergencyAccess && (
+          <Field label="Minimum waiting period for emergency contacts (hours)">
+            {(id) => <TextInput id={id} type="number" min={1} max={720} value={settings.emergencyWaitMinHours} onChange={num('emergencyWaitMinHours')} className="max-w-xs" />}
+          </Field>
+        )}
+      </div>
+
+      <Button type="submit" loading={saving}>
+        Save settings
+      </Button>
+    </form>
+  );
+}
+
+function AddContactDialog({ onClose, onAdded }: { onClose: () => void; onAdded: () => void }) {
+  const { currentOrg, getOrgKey } = useVault();
+  const toast = useToast();
+  const [email, setEmail] = useState('');
+  const [name, setName] = useState('');
+  const [hours, setHours] = useState(48);
+  const [found, setFound] = useState<{ publicKey: string; fingerprint: string } | null>(null);
+  const [confirmed, setConfirmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const lookup = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!currentOrg) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const user = await emergencyApi.lookupContact(currentOrg.id, email.trim());
+      setFound({ publicKey: user.publicKey, fingerprint: await keyFingerprint(user.publicKey) });
+      if (!name && user.name) setName(user.name);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
   };
 
-  if (isLoading) {
-    return (
-      <div className="space-y-6">
-        <Skeleton className="h-8 w-48" />
-        <div className="space-y-4">
-          <Skeleton className="h-20" />
-          <Skeleton className="h-20" />
-          <Skeleton className="h-20" />
-        </div>
-      </div>
-    );
-  }
-
-  if (!settings) return null;
+  const add = async () => {
+    const orgKey = getOrgKey();
+    if (!currentOrg || !orgKey || !found) return;
+    setBusy(true);
+    try {
+      await emergencyApi.addContact(currentOrg.id, {
+        contactEmail: email.trim(),
+        contactName: name.trim() || undefined,
+        waitTimeHours: hours,
+        encryptedOrgKey: await encryptOrgKeyFor(orgKey, found.publicKey),
+      });
+      toast.success('Emergency contact added');
+      onAdded();
+    } catch (err) {
+      setError(errorMessage(err));
+      setBusy(false);
+    }
+  };
 
   return (
-    <div className="space-y-8">
-      <div>
-        <h2 className="text-2xl font-bold text-gray-900 dark:text-gray-100">
-          Organization Settings
-        </h2>
-        <p className="mt-1 text-gray-600 dark:text-gray-400">
-          Configure security policies and defaults for {currentOrg?.name}
+    <Modal
+      title="Add emergency contact"
+      onClose={onClose}
+      footer={
+        found ? (
+          <>
+            <Button variant="secondary" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button disabled={!confirmed} loading={busy} onClick={() => void add()}>
+              Add contact
+            </Button>
+          </>
+        ) : undefined
+      }
+    >
+      <div className="space-y-4 text-sm text-gray-700 dark:text-gray-300">
+        <p>
+          An emergency contact is a trusted person outside the organization (for example a board chair) who can request read-only access
+          if the admins become unreachable. Admins are emailed and can deny the request during the waiting period.
         </p>
+        {error && <Alert tone="error">{error}</Alert>}
+        {!found ? (
+          <form onSubmit={lookup} className="space-y-3">
+            <Field label="Their CloudVault email" hint="They need an account with a master password already.">
+              {(id) => <TextInput id={id} type="email" required value={email} onChange={(e) => setEmail(e.target.value)} />}
+            </Field>
+            <Button type="submit" loading={busy}>
+              Look up
+            </Button>
+          </form>
+        ) : (
+          <>
+            <Field label="Name (optional)">{(id) => <TextInput id={id} value={name} onChange={(e) => setName(e.target.value)} />}</Field>
+            <Field label="Waiting period (hours)">
+              {(id) => <TextInput id={id} type="number" min={1} max={720} value={hours} onChange={(e) => setHours(Number(e.target.value))} />}
+            </Field>
+            <p>Ask them to read their key fingerprint from their Preferences page. It must match:</p>
+            <div className="text-center">
+              <Fingerprint value={found.fingerprint} />
+            </div>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} className="h-4 w-4 rounded border-gray-300 text-vault-600" />
+              The fingerprint matches
+            </label>
+          </>
+        )}
       </div>
+    </Modal>
+  );
+}
 
-      {/* Password Policies */}
-      <SettingsSection
-        title="Password Policies"
-        description="Configure password requirements and rotation"
-      >
-        <div className="grid gap-4 md:grid-cols-2">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-              Minimum Password Length
-            </label>
-            <select
-              value={settings.minPasswordLength}
-              onChange={(e) => updateSetting('minPasswordLength', Number(e.target.value))}
-              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-            >
-              {[8, 12, 16, 20, 24, 32].map((len) => (
-                <option key={len} value={len}>{len} characters</option>
-              ))}
-            </select>
-            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-              For generated passwords
-            </p>
-          </div>
+function EmergencySection() {
+  const { currentOrg } = useVault();
+  const toast = useToast();
+  const [contacts, setContacts] = useState<EmergencyContact[] | null>(null);
+  const [requests, setRequests] = useState<EmergencyRequest[]>([]);
+  const [adding, setAdding] = useState(false);
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-              Default Password Expiry
-            </label>
-            <select
-              value={settings.passwordExpiryDays}
-              onChange={(e) => updateSetting('passwordExpiryDays', Number(e.target.value))}
-              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-            >
-              <option value={0}>No expiry</option>
-              <option value={30}>30 days</option>
-              <option value={60}>60 days</option>
-              <option value={90}>90 days</option>
-              <option value={180}>180 days</option>
-              <option value={365}>1 year</option>
-            </select>
-            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-              Applied to new passwords
-            </p>
-          </div>
-        </div>
-      </SettingsSection>
+  const load = useCallback(() => {
+    if (!currentOrg) return;
+    emergencyApi.listContacts(currentOrg.id).then(setContacts).catch(() => setContacts([]));
+    emergencyApi.listRequests(currentOrg.id).then(setRequests).catch(() => setRequests([]));
+  }, [currentOrg]);
+  useEffect(load, [load]);
 
-      {/* Sharing Settings */}
-      <SettingsSection
-        title="Share Links"
-        description="Control how secrets can be shared externally"
-      >
-        <div className="space-y-4">
-          <label className="flex items-center gap-3">
-            <input
-              type="checkbox"
-              checked={settings.allowShareLinks}
-              onChange={(e) => updateSetting('allowShareLinks', e.target.checked)}
-              className="rounded border-gray-300 text-vault-600 focus:ring-vault-500 h-5 w-5"
-            />
-            <div>
-              <span className="font-medium text-gray-900 dark:text-gray-100">
-                Enable Share Links
-              </span>
-              <p className="text-sm text-gray-500 dark:text-gray-400">
-                Allow members to create temporary share links for secrets
-              </p>
-            </div>
-          </label>
+  if (!currentOrg) return null;
 
-          {settings.allowShareLinks && (
-            <div className="ml-8">
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                Maximum Link Duration
-              </label>
-              <select
-                value={settings.shareLinkMaxHours}
-                onChange={(e) => updateSetting('shareLinkMaxHours', Number(e.target.value))}
-                className="w-full max-w-xs px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-              >
-                <option value={24}>1 day</option>
-                <option value={48}>2 days</option>
-                <option value={72}>3 days</option>
-                <option value={168}>1 week</option>
-                <option value={336}>2 weeks</option>
-                <option value={720}>30 days</option>
-              </select>
-            </div>
-          )}
-        </div>
-      </SettingsSection>
+  const act = async (fn: () => Promise<unknown>, message: string) => {
+    try {
+      await fn();
+      toast.success(message);
+      load();
+    } catch (err) {
+      toast.error('Action failed', errorMessage(err));
+    }
+  };
 
-      {/* Emergency Access */}
-      <SettingsSection
-        title="Emergency Access"
-        description="Configure trusted contact emergency access"
-      >
-        <div className="space-y-4">
-          <label className="flex items-center gap-3">
-            <input
-              type="checkbox"
-              checked={settings.allowEmergencyAccess}
-              onChange={(e) => updateSetting('allowEmergencyAccess', e.target.checked)}
-              className="rounded border-gray-300 text-vault-600 focus:ring-vault-500 h-5 w-5"
-            />
-            <div>
-              <span className="font-medium text-gray-900 dark:text-gray-100">
-                Enable Emergency Access
-              </span>
-              <p className="text-sm text-gray-500 dark:text-gray-400">
-                Allow members to designate trusted contacts for emergency access
-              </p>
-            </div>
-          </label>
+  const open = requests.filter((r) => r.canRespond);
 
-          {settings.allowEmergencyAccess && (
-            <div className="ml-8">
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                Minimum Wait Period
-              </label>
-              <select
-                value={settings.emergencyWaitMinHours}
-                onChange={(e) => updateSetting('emergencyWaitMinHours', Number(e.target.value))}
-                className="w-full max-w-xs px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-              >
-                <option value={24}>24 hours (1 day)</option>
-                <option value={48}>48 hours (2 days)</option>
-                <option value={72}>72 hours (3 days)</option>
-                <option value={168}>168 hours (1 week)</option>
-              </select>
-              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                Time before emergency access is granted (can be denied during this period)
-              </p>
-            </div>
-          )}
-        </div>
-      </SettingsSection>
-
-      {/* Audit & Compliance */}
-      <SettingsSection
-        title="Audit & Compliance"
-        description="Configure audit log retention"
-      >
-        <div>
-          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-            Audit Log Retention
-          </label>
-          <select
-            value={settings.auditRetentionDays}
-            onChange={(e) => updateSetting('auditRetentionDays', Number(e.target.value))}
-            className="w-full max-w-xs px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-          >
-            <option value={30}>30 days</option>
-            <option value={90}>90 days</option>
-            <option value={180}>180 days</option>
-            <option value={365}>1 year</option>
-            <option value={730}>2 years</option>
-          </select>
-          <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-            Audit logs older than this will be automatically deleted
+  return (
+    <div className="space-y-4">
+      {open.map((r) => (
+        <Alert key={r.id} tone="warning" title={`${r.contactName || r.contactEmail} requested emergency access`}>
+          <p>Reason: {r.reason}</p>
+          <p>
+            {r.status === 'approved' ? 'Approved; they can claim access now.' : `Access will be granted automatically on ${new Date(r.grantAt.replace(' ', 'T') + 'Z').toLocaleString()}.`}
           </p>
-        </div>
-      </SettingsSection>
-
-      {/* Two-Factor Authentication */}
-      <SettingsSection
-        title="Two-Factor Authentication"
-        description="Require 2FA for organization members"
-      >
-        <label className="flex items-center gap-3 opacity-60 cursor-not-allowed">
-          <input
-            type="checkbox"
-            checked={settings.require2fa}
-            onChange={(e) => updateSetting('require2fa', e.target.checked)}
-            disabled
-            className="rounded border-gray-300 text-vault-600 focus:ring-vault-500 h-5 w-5"
-          />
-          <div>
-            <span className="font-medium text-gray-900 dark:text-gray-100 flex items-center gap-2">
-              Require Two-Factor Authentication
-              <span className="text-xs px-2 py-0.5 bg-yellow-100 dark:bg-yellow-900 text-yellow-700 dark:text-yellow-300 rounded-full">
-                Coming Soon
-              </span>
-            </span>
-            <p className="text-sm text-gray-500 dark:text-gray-400">
-              All members must set up 2FA to access the vault
-            </p>
+          <div className="mt-2 flex gap-2">
+            {r.status === 'pending' && (
+              <Button size="sm" variant="secondary" onClick={() => void act(() => emergencyApi.approveRequest(currentOrg.id, r.id), 'Request approved')}>
+                Approve now
+              </Button>
+            )}
+            <Button size="sm" variant="danger" onClick={() => void act(() => emergencyApi.denyRequest(currentOrg.id, r.id), 'Request denied')}>
+              Deny
+            </Button>
           </div>
-        </label>
-      </SettingsSection>
+        </Alert>
+      ))}
 
-      {/* Save Button */}
-      <div className="flex justify-end pt-4 border-t border-gray-200 dark:border-gray-700">
-        <button
-          onClick={saveSettings}
-          disabled={isSaving}
-          className="px-6 py-2 bg-vault-600 text-white rounded-lg hover:bg-vault-700 disabled:opacity-50"
-        >
-          {isSaving ? 'Saving...' : 'Save Settings'}
-        </button>
-      </div>
+      {contacts === null ? (
+        <Spinner />
+      ) : contacts.length === 0 ? (
+        <p className="text-sm text-gray-500">No emergency contacts.</p>
+      ) : (
+        <ul className="divide-y divide-gray-200 text-sm dark:divide-gray-700">
+          {contacts.map((c) => (
+            <li key={c.id} className="flex items-center gap-3 py-2">
+              <div className="flex-1">
+                <p className="font-medium text-gray-900 dark:text-white">{c.contactName || c.contactEmail}</p>
+                <p className="text-xs text-gray-500">
+                  {c.contactEmail}, {c.waitTimeHours}h wait
+                </p>
+              </div>
+              <Button size="sm" variant="secondary" onClick={() => void act(() => emergencyApi.removeContact(currentOrg.id, c.id), 'Contact removed')}>
+                Remove
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <Button variant="secondary" onClick={() => setAdding(true)}>
+        Add emergency contact
+      </Button>
+
+      {requests.some((r) => !r.canRespond) && (
+        <details className="text-sm">
+          <summary className="cursor-pointer text-gray-500">Past requests</summary>
+          <ul className="mt-2 space-y-1">
+            {requests
+              .filter((r) => !r.canRespond)
+              .map((r) => (
+                <li key={r.id} className="text-gray-600 dark:text-gray-400">
+                  {new Date(r.requestedAt.replace(' ', 'T') + 'Z').toLocaleDateString()}: {r.contactEmail} <Badge>{r.status}</Badge>
+                  {r.resolvedByEmail && ` by ${r.resolvedByEmail}`}
+                </li>
+              ))}
+          </ul>
+        </details>
+      )}
+
+      {adding && (
+        <AddContactDialog
+          onClose={() => setAdding(false)}
+          onAdded={() => {
+            setAdding(false);
+            load();
+          }}
+        />
+      )}
     </div>
   );
 }
 
-interface SettingsSectionProps {
-  title: string;
-  description: string;
-  children: React.ReactNode;
-}
+export default function OrgSettings() {
+  const { currentOrg, loadOrganizations } = useVault();
+  const toast = useToast();
+  const navigate = useNavigate();
+  const [name, setName] = useState(currentOrg?.name ?? '');
+  const [showRotation, setShowRotation] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [confirmName, setConfirmName] = useState('');
+  const [busy, setBusy] = useState(false);
 
-function SettingsSection({ title, description, children }: SettingsSectionProps) {
+  useEffect(() => setName(currentOrg?.name ?? ''), [currentOrg]);
+  if (!currentOrg) return null;
+
+  const rename = async (e: FormEvent) => {
+    e.preventDefault();
+    try {
+      await orgsApi.rename(currentOrg.id, name.trim());
+      await loadOrganizations();
+      toast.success('Organization renamed');
+    } catch (err) {
+      toast.error('Could not rename', errorMessage(err));
+    }
+  };
+
+  const leave = async () => {
+    try {
+      await orgsApi.leave(currentOrg.id);
+      toast.success(`You left ${currentOrg.name}`);
+      await loadOrganizations();
+      navigate('/');
+    } catch (err) {
+      toast.error('Could not leave', errorMessage(err));
+    }
+  };
+
+  const destroy = async () => {
+    setBusy(true);
+    try {
+      await orgsApi.delete(currentOrg.id);
+      toast.success(`${currentOrg.name} was deleted`);
+      setDeleting(false);
+      await loadOrganizations();
+      navigate('/');
+    } catch (err) {
+      toast.error('Could not delete', errorMessage(err));
+      setBusy(false);
+    }
+  };
+
   return (
-    <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6">
-      <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">{title}</h3>
-      <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">{description}</p>
-      {children}
+    <div className="space-y-6">
+      <PageHeader title="Settings" description={`Policies and administration for ${currentOrg.name}`} />
+
+      <Card title="Organization name">
+        <form onSubmit={rename} className="flex gap-2">
+          <TextInput aria-label="Organization name" value={name} maxLength={100} onChange={(e) => setName(e.target.value)} />
+          <Button type="submit" disabled={!name.trim() || name.trim() === currentOrg.name}>
+            Rename
+          </Button>
+        </form>
+      </Card>
+
+      <Card title="Policies">
+        <PolicyForm />
+      </Card>
+
+      <Card title="Emergency access" description="Break-glass access for a trusted person if every admin is unreachable.">
+        <EmergencySection />
+      </Card>
+
+      <Card title="Vault key" description="Re-encrypt everything with a new key. Do this after removing someone, or if you think the key was exposed.">
+        <Button variant="secondary" onClick={() => setShowRotation(true)}>
+          Rotate vault key
+        </Button>
+      </Card>
+
+      <Card title="Leave or delete">
+        <div className="flex flex-wrap gap-2">
+          <Button variant="secondary" onClick={() => void leave()}>
+            Leave organization
+          </Button>
+          <Button variant="danger" onClick={() => setDeleting(true)}>
+            Delete organization
+          </Button>
+        </div>
+      </Card>
+
+      {showRotation && <KeyRotationDialog onClose={() => setShowRotation(false)} />}
+      {deleting && (
+        <Modal
+          title={`Delete ${currentOrg.name}?`}
+          onClose={() => setDeleting(false)}
+          footer={
+            <>
+              <Button variant="secondary" onClick={() => setDeleting(false)}>
+                Cancel
+              </Button>
+              <Button variant="danger" loading={busy} disabled={confirmName !== currentOrg.name} onClick={() => void destroy()}>
+                Delete forever
+              </Button>
+            </>
+          }
+        >
+          <div className="space-y-3 text-sm text-gray-700 dark:text-gray-300">
+            <p>This permanently deletes every item, its history, categories, share links and memberships. Export first if you need a backup.</p>
+            <Field label={`Type "${currentOrg.name}" to confirm`}>{(id) => <TextInput id={id} value={confirmName} onChange={(e) => setConfirmName(e.target.value)} />}</Field>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

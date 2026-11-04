@@ -1,10 +1,11 @@
 /**
- * Session Timeout Hook
- * 
- * Auto-locks the vault after a period of inactivity.
+ * Calls `onTimeout` after `timeoutMinutes` without user activity.
+ *
+ * Also checks when the tab becomes visible again, because browsers throttle
+ * timers in background tabs. A timeout of 0 disables it.
  */
 
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef } from 'react';
 
 interface UseSessionTimeoutOptions {
   timeoutMinutes: number;
@@ -12,88 +13,45 @@ interface UseSessionTimeoutOptions {
   enabled?: boolean;
 }
 
-export function useSessionTimeout({
-  timeoutMinutes,
-  onTimeout,
-  enabled = true,
-}: UseSessionTimeoutOptions) {
-  const timeoutRef = useRef<number | null>(null);
-  const lastActivityRef = useRef<number>(Date.now());
+const ACTIVITY_EVENTS = ['mousedown', 'keydown', 'touchstart', 'scroll', 'wheel'] as const;
 
-  const resetTimer = useCallback(() => {
-    lastActivityRef.current = Date.now();
-    
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-    }
-    
-    if (enabled && timeoutMinutes > 0) {
-      timeoutRef.current = window.setTimeout(() => {
-        onTimeout();
-      }, timeoutMinutes * 60 * 1000);
-    }
-  }, [timeoutMinutes, onTimeout, enabled]);
+export function useSessionTimeout({ timeoutMinutes, onTimeout, enabled = true }: UseSessionTimeoutOptions): void {
+  const onTimeoutRef = useRef(onTimeout);
+  onTimeoutRef.current = onTimeout;
 
-  // Set up activity listeners
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || timeoutMinutes <= 0) return;
 
-    const events = ['mousedown', 'keydown', 'touchstart', 'scroll'];
-    
-    const handleActivity = () => {
-      resetTimer();
+    const limit = timeoutMinutes * 60_000;
+    let lastActivity = Date.now();
+    let timer = 0;
+
+    const fire = () => {
+      window.clearTimeout(timer);
+      onTimeoutRef.current();
+    };
+    const schedule = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(fire, limit);
+    };
+    const onActivity = () => {
+      lastActivity = Date.now();
+      schedule();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (Date.now() - lastActivity >= limit) fire();
+      else schedule();
     };
 
-    events.forEach((event) => {
-      document.addEventListener(event, handleActivity, { passive: true });
-    });
-
-    // Initial timer
-    resetTimer();
+    ACTIVITY_EVENTS.forEach((e) => document.addEventListener(e, onActivity, { passive: true }));
+    document.addEventListener('visibilitychange', onVisibility);
+    schedule();
 
     return () => {
-      events.forEach((event) => {
-        document.removeEventListener(event, handleActivity);
-      });
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
+      window.clearTimeout(timer);
+      ACTIVITY_EVENTS.forEach((e) => document.removeEventListener(e, onActivity));
+      document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, [enabled, resetTimer]);
-
-  // Lock on visibility change (tab hidden)
-  useEffect(() => {
-    if (!enabled) return;
-
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        // Optional: Could trigger immediate lock when tab is hidden
-        // For now, just note the time
-        lastActivityRef.current = Date.now();
-      } else {
-        // Check if we've been away too long
-        const elapsed = Date.now() - lastActivityRef.current;
-        if (elapsed > timeoutMinutes * 60 * 1000) {
-          onTimeout();
-        } else {
-          resetTimer();
-        }
-      }
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    
-    return () => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-    };
-  }, [enabled, timeoutMinutes, onTimeout, resetTimer]);
-
-  return {
-    resetTimer,
-    getTimeUntilTimeout: () => {
-      const elapsed = Date.now() - lastActivityRef.current;
-      const remaining = (timeoutMinutes * 60 * 1000) - elapsed;
-      return Math.max(0, remaining);
-    },
-  };
+  }, [enabled, timeoutMinutes]);
 }

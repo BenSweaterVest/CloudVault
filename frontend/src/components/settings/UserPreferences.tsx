@@ -1,230 +1,249 @@
 /**
- * User Preferences Component
- * 
- * Allows users to manage their personal settings:
- * - Theme preferences
- * - Session timeout
- * - Clipboard auto-clear
- * - Display preferences
- * 
- * @module components/settings/UserPreferences
+ * Personal preferences and account security: profile, appearance, auto-lock,
+ * clipboard clearing, key fingerprint, master password change, sessions.
  */
 
-import { useState, useEffect } from 'react';
-import { preferencesApi, type UserPreferences } from '../../lib/api';
+import { useEffect, useState, type FormEvent } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../../lib/auth';
+import { usePreferences } from '../../lib/preferences';
+import { authApi, type UserPreferences as Prefs } from '../../lib/api';
+import { CURRENT_KDF_ITERATIONS, keyFingerprint, publicKeyFromPrivateKey, unwrapPrivateKey, wrapPrivateKey } from '../../lib/crypto';
+import { useVault } from '../../hooks/useVault';
+import { assessMasterPassword } from '../../lib/passwords';
+import { useTheme, type Theme } from '../ui/ThemeProvider';
 import { useToast } from '../ui/Toast';
-import { useTheme } from '../ui/ThemeProvider';
+import { Alert, Button, Card, Checkbox, Field, Fingerprint, PageHeader, Select, TextInput, errorMessage } from '../ui/kit';
+import { MIN_MASTER_PASSWORD_LENGTH } from '../auth/MasterPasswordSetup';
 
-/**
- * Default preferences
- */
-const DEFAULT_PREFERENCES: UserPreferences = {
-  theme: 'system',
-  sessionTimeout: 15,
-  clipboardClear: 30,
-  showFavicons: true,
-  compactView: false,
-};
+function ProfileCard() {
+  const { user, updateUser } = useAuth();
+  const toast = useToast();
+  const [name, setName] = useState(user?.name ?? '');
 
-export default function UserPreferencesPage() {
-  const { success, error: showError } = useToast();
-  const { setTheme } = useTheme();
-  
-  const [preferences, setPreferences] = useState<UserPreferences>(DEFAULT_PREFERENCES);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isSaving, setIsSaving] = useState(false);
-
-  // Load preferences on mount
-  useEffect(() => {
-    loadPreferences();
-  }, []);
-
-  const loadPreferences = async () => {
-    setIsLoading(true);
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
     try {
-      const prefs = await preferencesApi.get();
-      setPreferences(prefs);
+      updateUser(await authApi.updateProfile(name.trim() || null));
+      toast.success('Profile saved');
     } catch (err) {
-      // Use defaults if no preferences exist
-      setPreferences(DEFAULT_PREFERENCES);
-    } finally {
-      setIsLoading(false);
+      toast.error('Could not save', errorMessage(err));
     }
   };
-
-  const handleSave = async () => {
-    setIsSaving(true);
-    try {
-      await preferencesApi.update(preferences);
-      // Apply theme immediately
-      setTheme(preferences.theme);
-      success('Preferences saved');
-    } catch (err) {
-      showError('Failed to save preferences');
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
-  const updatePreference = <K extends keyof UserPreferences>(
-    key: K,
-    value: UserPreferences[K]
-  ) => {
-    setPreferences((prev) => ({ ...prev, [key]: value }));
-  };
-
-  if (isLoading) {
-    return (
-      <div className="flex justify-center py-12">
-        <div className="animate-spin w-8 h-8 border-2 border-vault-600 border-t-transparent rounded-full" />
-      </div>
-    );
-  }
 
   return (
-    <div className="max-w-2xl mx-auto">
-      <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100 mb-6">
-        Preferences
-      </h1>
+    <Card title="Profile" description={user?.email}>
+      <form onSubmit={save} className="flex gap-2">
+        <TextInput aria-label="Display name" placeholder="Display name" maxLength={100} value={name} onChange={(e) => setName(e.target.value)} />
+        <Button type="submit">Save</Button>
+      </form>
+    </Card>
+  );
+}
 
-      <div className="space-y-8">
-        {/* Appearance */}
-        <section className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6">
-          <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">
-            Appearance
-          </h2>
-          
-          <div className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                Theme
-              </label>
-              <select
-                value={preferences.theme}
-                onChange={(e) => updatePreference('theme', e.target.value as UserPreferences['theme'])}
-                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-vault-500 focus:border-transparent"
-              >
-                <option value="light">Light</option>
-                <option value="dark">Dark</option>
-                <option value="system">System (auto)</option>
-              </select>
-              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                Choose how CloudVault looks to you
-              </p>
-            </div>
+function PreferencesCard() {
+  const { preferences, update } = usePreferences();
+  const { theme, setTheme } = useTheme();
+  const toast = useToast();
 
-            <div className="flex items-center justify-between">
-              <div>
-                <span className="font-medium text-gray-900 dark:text-gray-100">Compact View</span>
-                <p className="text-sm text-gray-500 dark:text-gray-400">
-                  Show more secrets per page with smaller cards
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => updatePreference('compactView', !preferences.compactView)}
-                className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-vault-500 focus:ring-offset-2 ${
-                  preferences.compactView ? 'bg-vault-600' : 'bg-gray-200 dark:bg-gray-700'
-                }`}
-                role="switch"
-                aria-checked={preferences.compactView}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                    preferences.compactView ? 'translate-x-5' : 'translate-x-0'
-                  }`}
-                />
-              </button>
-            </div>
+  const change = async (changes: Partial<Prefs>) => {
+    try {
+      await update(changes);
+    } catch (err) {
+      toast.error('Could not save preference', errorMessage(err));
+    }
+  };
 
-            <div className="flex items-center justify-between">
-              <div>
-                <span className="font-medium text-gray-900 dark:text-gray-100">Show Favicons</span>
-                <p className="text-sm text-gray-500 dark:text-gray-400">
-                  Display website icons next to passwords
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => updatePreference('showFavicons', !preferences.showFavicons)}
-                className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-vault-500 focus:ring-offset-2 ${
-                  preferences.showFavicons ? 'bg-vault-600' : 'bg-gray-200 dark:bg-gray-700'
-                }`}
-                role="switch"
-                aria-checked={preferences.showFavicons}
-              >
-                <span
-                  className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                    preferences.showFavicons ? 'translate-x-5' : 'translate-x-0'
-                  }`}
-                />
-              </button>
-            </div>
-          </div>
-        </section>
-
-        {/* Security */}
-        <section className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6">
-          <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">
-            Security
-          </h2>
-          
-          <div className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                Auto-lock Timeout
-              </label>
-              <select
-                value={preferences.sessionTimeout}
-                onChange={(e) => updatePreference('sessionTimeout', Number(e.target.value))}
-                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-vault-500 focus:border-transparent"
-              >
-                <option value={1}>1 minute</option>
-                <option value={5}>5 minutes</option>
-                <option value={15}>15 minutes</option>
-                <option value={30}>30 minutes</option>
-                <option value={60}>1 hour</option>
-                <option value={120}>2 hours</option>
-              </select>
-              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                Automatically lock your vault after inactivity
-              </p>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                Clipboard Auto-clear
-              </label>
-              <select
-                value={preferences.clipboardClear}
-                onChange={(e) => updatePreference('clipboardClear', Number(e.target.value))}
-                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-vault-500 focus:border-transparent"
-              >
-                <option value={0}>Disabled</option>
-                <option value={10}>10 seconds</option>
-                <option value={30}>30 seconds</option>
-                <option value={60}>1 minute</option>
-                <option value={120}>2 minutes</option>
-                <option value={300}>5 minutes</option>
-              </select>
-              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                Clear copied passwords from clipboard after a delay
-              </p>
-            </div>
-          </div>
-        </section>
-
-        {/* Save Button */}
-        <div className="flex justify-end">
-          <button
-            onClick={handleSave}
-            disabled={isSaving}
-            className="px-6 py-2 bg-vault-600 text-white rounded-lg hover:bg-vault-700 disabled:opacity-50 transition-colors"
-          >
-            {isSaving ? 'Saving...' : 'Save Preferences'}
-          </button>
-        </div>
+  return (
+    <Card title="Preferences">
+      <div className="grid gap-4 sm:grid-cols-3">
+        <Field label="Theme">
+          {(id) => (
+            <Select
+              id={id}
+              value={theme}
+              onChange={(e) => {
+                setTheme(e.target.value as Theme);
+                void change({ theme: e.target.value as Theme });
+              }}
+            >
+              <option value="system">Match system</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </Select>
+          )}
+        </Field>
+        <Field label="Lock and sign out after inactivity" hint="Locks the vault here, and ends the session on the server.">
+          {(id) => (
+            <Select id={id} value={preferences.sessionTimeout} onChange={(e) => void change({ sessionTimeout: Number(e.target.value) })}>
+              {[5, 15, 30, 60, 240, 480, 0].map((m) => (
+                <option key={m} value={m}>
+                  {m === 0 ? 'Never' : m < 60 ? `${m} minutes` : `${m / 60} hour${m === 60 ? '' : 's'}`}
+                </option>
+              ))}
+            </Select>
+          )}
+        </Field>
+        <Field label="Clear copied passwords after">
+          {(id) => (
+            <Select id={id} value={preferences.clipboardClear} onChange={(e) => void change({ clipboardClear: Number(e.target.value) })}>
+              {[10, 30, 60, 120, 0].map((s) => (
+                <option key={s} value={s}>
+                  {s === 0 ? 'Never' : `${s} seconds`}
+                </option>
+              ))}
+            </Select>
+          )}
+        </Field>
       </div>
+      <div className="mt-4">
+        <Checkbox label="Compact list" checked={preferences.compactView} onChange={(e) => void change({ compactView: e.target.checked })} />
+      </div>
+    </Card>
+  );
+}
+
+function KeyCard() {
+  const { user } = useAuth();
+  const { isUnlocked, getPrivateKey } = useVault();
+  const [fingerprint, setFingerprint] = useState<string | null>(null);
+  const [mismatch, setMismatch] = useState(false);
+
+  useEffect(() => {
+    const key = getPrivateKey();
+    if (!key || !user?.publicKey) {
+      setFingerprint(null);
+      return;
+    }
+    // Derived from the private key on this device, so it does not rely on
+    // what the server says the public key is.
+    void publicKeyFromPrivateKey(key).then(async (pub) => {
+      setFingerprint(await keyFingerprint(pub));
+      setMismatch(pub !== user.publicKey);
+    });
+  }, [getPrivateKey, user]);
+
+  return (
+    <Card title="Your key fingerprint" description="Read this to an admin when they approve you, so they know the key is really yours.">
+      {isUnlocked ? (
+        <div className="space-y-3">
+          <Fingerprint value={fingerprint} />
+          {mismatch && (
+            <Alert tone="error" title="Public key mismatch">
+              The public key stored on the server does not match your private key. Do not let anyone approve you until this is
+              resolved, and contact your administrator.
+            </Alert>
+          )}
+        </div>
+      ) : (
+        <p className="text-sm text-gray-500">Unlock your vault to see your fingerprint.</p>
+      )}
+    </Card>
+  );
+}
+
+function MasterPasswordCard() {
+  const { user, updateUser } = useAuth();
+  const toast = useToast();
+  const [current, setCurrent] = useState('');
+  const [next, setNext] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!user?.encryptedPrivateKey || !user.salt) return null;
+  const strength = assessMasterPassword(next);
+  const valid = next.length >= MIN_MASTER_PASSWORD_LENGTH && next === confirm && strength.score >= 2;
+  const outdated = user.kdfIterations < CURRENT_KDF_ITERATIONS;
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!user.encryptedPrivateKey || !user.salt) return;
+    setBusy(true);
+    setError(null);
+    try {
+      let privateKey: CryptoKey;
+      try {
+        privateKey = await unwrapPrivateKey(user.encryptedPrivateKey, user.salt, current, user.kdfIterations);
+      } catch {
+        throw new Error('Your current master password is incorrect');
+      }
+      const wrapped = await wrapPrivateKey(privateKey, next);
+      updateUser(await authApi.changeMasterPassword(wrapped));
+      setCurrent('');
+      setNext('');
+      setConfirm('');
+      toast.success('Master password changed', 'Your other sessions were signed out.');
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card title="Change master password" description="Your keys are re-encrypted on this device. Your access to organizations does not change.">
+      <form onSubmit={submit} className="space-y-4">
+        {outdated && (
+          <Alert tone="warning">
+            Your keys use an older, weaker password-hashing setting. Changing your master password (you can reuse the same one) upgrades it.
+          </Alert>
+        )}
+        {error && <Alert tone="error">{error}</Alert>}
+        <Field label="Current master password">
+          {(id) => <TextInput id={id} type="password" autoComplete="current-password" required value={current} onChange={(e) => setCurrent(e.target.value)} />}
+        </Field>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="New master password" hint={next ? `${strength.label}${strength.feedback ? `: ${strength.feedback}` : ''}` : `At least ${MIN_MASTER_PASSWORD_LENGTH} characters`}>
+            {(id) => <TextInput id={id} type="password" autoComplete="new-password" required value={next} onChange={(e) => setNext(e.target.value)} />}
+          </Field>
+          <Field label="Confirm new password" error={confirm && confirm !== next ? 'Does not match' : null}>
+            {(id) => <TextInput id={id} type="password" autoComplete="new-password" required value={confirm} onChange={(e) => setConfirm(e.target.value)} />}
+          </Field>
+        </div>
+        <Button type="submit" loading={busy} disabled={!valid || !current}>
+          Change master password
+        </Button>
+      </form>
+    </Card>
+  );
+}
+
+function SessionsCard() {
+  const { logout } = useAuth();
+  const toast = useToast();
+  const navigate = useNavigate();
+
+  const signOutEverywhere = async () => {
+    try {
+      const { sessionsRevoked } = await authApi.logoutAll();
+      toast.success(`Signed out of ${sessionsRevoked} session${sessionsRevoked === 1 ? '' : 's'}`);
+    } catch (err) {
+      toast.error('Could not sign out everywhere', errorMessage(err));
+      return;
+    }
+    await logout();
+    navigate('/login');
+  };
+
+  return (
+    <Card title="Sessions" description="Sign out on every device, including this one. Use this if a device is lost.">
+      <Button variant="secondary" onClick={() => void signOutEverywhere()}>
+        Sign out everywhere
+      </Button>
+    </Card>
+  );
+}
+
+export default function UserPreferences() {
+  return (
+    <div className="mx-auto max-w-3xl space-y-6">
+      <PageHeader title="Preferences and security" />
+      <ProfileCard />
+      <PreferencesCard />
+      <KeyCard />
+      <MasterPasswordCard />
+      <SessionsCard />
     </div>
   );
 }

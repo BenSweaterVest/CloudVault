@@ -1,281 +1,177 @@
 /**
- * Password Health Dashboard
- * 
- * Shows overview of password security status:
- * - Health score
- * - Expiring passwords
- * - Old passwords needing rotation
- * - Security recommendations
+ * Password health: expiry and age from the server, plus an on-demand
+ * weak/reused password check that decrypts everything locally.
  */
 
-import { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import { useVault } from '../../hooks/useVault';
-import { Skeleton } from '../ui/Skeleton';
+import { orgSettingsApi, secretsApi, type HealthReport } from '../../lib/api';
+import { decryptSecretPayload, sha256Hex } from '../../lib/crypto';
+import { assessPassword } from '../../lib/passwords';
+import { Alert, Button, Card, PageHeader, Spinner, cx, errorMessage } from '../ui/kit';
 
-interface HealthData {
-  healthScore: number;
-  totalSecrets: number;
-  metrics: {
-    expiringSoon: number;
-    expired: number;
-    oldPasswords: number;
-  };
-  expiringSecrets: Array<{
-    id: string;
-    name: string;
-    expiresAt: string;
-    secretType: string;
-    daysUntilExpiry: number;
-  }>;
-  oldPasswords: Array<{
-    id: string;
-    name: string;
-    lastUpdated: string;
-    daysSinceUpdate: number;
-  }>;
+interface LocalReport {
+  weak: Array<{ id: string; name: string; label: string }>;
+  reused: Array<{ names: string[]; ids: string[] }>;
+  checked: number;
 }
 
-export default function HealthDashboard() {
-  const { currentOrg } = useVault();
-  const [health, setHealth] = useState<HealthData | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!currentOrg) return;
-
-    const fetchHealth = async () => {
-      setIsLoading(true);
-      try {
-        const token = localStorage.getItem('cloudvault_token');
-        const response = await fetch(`/api/organizations/${currentOrg.id}/health`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        
-        if (!response.ok) {
-          throw new Error('Failed to fetch health data');
-        }
-        
-        const data = await response.json();
-        setHealth(data);
-      } catch (err) {
-        setError((err as Error).message);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-
-    fetchHealth();
-  }, [currentOrg]);
-
-  if (isLoading) {
-    return (
-      <div className="space-y-6">
-        <Skeleton className="h-48 w-full" />
-        <div className="grid gap-4 md:grid-cols-3">
-          <Skeleton className="h-24" />
-          <Skeleton className="h-24" />
-          <Skeleton className="h-24" />
-        </div>
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4">
-        <p className="text-red-700 dark:text-red-300">Error: {error}</p>
-      </div>
-    );
-  }
-
-  if (!health) return null;
-
-  const getScoreColor = (score: number) => {
-    if (score >= 80) return 'text-green-600 dark:text-green-400';
-    if (score >= 60) return 'text-yellow-600 dark:text-yellow-400';
-    return 'text-red-600 dark:text-red-400';
-  };
-
-  const getScoreBgColor = (score: number) => {
-    if (score >= 80) return 'bg-green-500';
-    if (score >= 60) return 'bg-yellow-500';
-    return 'bg-red-500';
-  };
-
+function Stat({ label, value, tone }: { label: string; value: number | string; tone?: 'red' | 'amber' | 'green' }) {
   return (
-    <div className="space-y-6">
-      {/* Health Score */}
-      <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6">
-        <div className="flex items-center justify-between">
-          <div>
-            <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-              Password Health Score
-            </h2>
-            <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-              Based on {health.totalSecrets} passwords
-            </p>
-          </div>
-          <div className="text-right">
-            <div className={`text-5xl font-bold ${getScoreColor(health.healthScore)}`}>
-              {health.healthScore}
-            </div>
-            <div className="text-sm text-gray-500 dark:text-gray-400">out of 100</div>
-          </div>
-        </div>
-        
-        {/* Progress bar */}
-        <div className="mt-4 h-3 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-          <div
-            className={`h-full transition-all ${getScoreBgColor(health.healthScore)}`}
-            style={{ width: `${health.healthScore}%` }}
-          />
-        </div>
-      </div>
-
-      {/* Metrics Cards */}
-      <div className="grid gap-4 md:grid-cols-3">
-        <MetricCard
-          title="Expiring Soon"
-          count={health.metrics.expiringSoon}
-          icon={
-            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-          }
-          color="yellow"
-          description="Within 30 days"
-        />
-        <MetricCard
-          title="Expired"
-          count={health.metrics.expired}
-          icon={
-            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-            </svg>
-          }
-          color="red"
-          description="Need immediate attention"
-        />
-        <MetricCard
-          title="Old Passwords"
-          count={health.metrics.oldPasswords}
-          icon={
-            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-            </svg>
-          }
-          color="orange"
-          description="90+ days old"
-        />
-      </div>
-
-      {/* Expiring Secrets List */}
-      {health.expiringSecrets.length > 0 && (
-        <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">
-            Expiring Soon
-          </h3>
-          <div className="space-y-3">
-            {health.expiringSecrets.map((secret) => (
-              <div
-                key={secret.id}
-                className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg"
-              >
-                <div>
-                  <p className="font-medium text-gray-900 dark:text-gray-100">{secret.name}</p>
-                  <p className="text-sm text-gray-500 dark:text-gray-400">
-                    Expires {new Date(secret.expiresAt).toLocaleDateString()}
-                  </p>
-                </div>
-                <span
-                  className={`px-2 py-1 text-xs font-medium rounded-full ${
-                    secret.daysUntilExpiry <= 7
-                      ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
-                      : 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300'
-                  }`}
-                >
-                  {secret.daysUntilExpiry <= 0
-                    ? 'Expired'
-                    : `${secret.daysUntilExpiry} days left`}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Old Passwords List */}
-      {health.oldPasswords.length > 0 && (
-        <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-4">
-            Passwords Needing Rotation
-          </h3>
-          <div className="space-y-3">
-            {health.oldPasswords.map((secret) => (
-              <div
-                key={secret.id}
-                className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg"
-              >
-                <div>
-                  <p className="font-medium text-gray-900 dark:text-gray-100">{secret.name}</p>
-                  <p className="text-sm text-gray-500 dark:text-gray-400">
-                    Last updated {new Date(secret.lastUpdated).toLocaleDateString()}
-                  </p>
-                </div>
-                <span className="px-2 py-1 text-xs font-medium rounded-full bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300">
-                  {secret.daysSinceUpdate} days old
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* All Clear Message */}
-      {health.healthScore === 100 && (
-        <div className="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg p-6 text-center">
-          <svg className="w-12 h-12 mx-auto text-green-500 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-          <h3 className="text-lg font-semibold text-green-700 dark:text-green-300">
-            Excellent Password Health!
-          </h3>
-          <p className="text-green-600 dark:text-green-400 mt-1">
-            All your passwords are up to date and secure.
-          </p>
-        </div>
-      )}
+    <div className="rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
+      <p className="text-sm text-gray-500 dark:text-gray-400">{label}</p>
+      <p
+        className={cx(
+          'mt-1 text-2xl font-semibold',
+          tone === 'red' ? 'text-red-600 dark:text-red-400' : tone === 'amber' ? 'text-amber-600 dark:text-amber-400' : tone === 'green' ? 'text-green-600 dark:text-green-400' : 'text-gray-900 dark:text-white'
+        )}
+      >
+        {value}
+      </p>
     </div>
   );
 }
 
-interface MetricCardProps {
-  title: string;
-  count: number;
-  icon: React.ReactNode;
-  color: 'yellow' | 'red' | 'orange' | 'green';
-  description: string;
-}
+export default function HealthDashboard() {
+  const { currentOrg, getOrgKey } = useVault();
+  const navigate = useNavigate();
+  const [report, setReport] = useState<HealthReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [local, setLocal] = useState<LocalReport | null>(null);
+  const [scanning, setScanning] = useState(false);
 
-function MetricCard({ title, count, icon, color, description }: MetricCardProps) {
-  const colorClasses = {
-    yellow: 'bg-yellow-100 text-yellow-600 dark:bg-yellow-900/30 dark:text-yellow-400',
-    red: 'bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-400',
-    orange: 'bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-400',
-    green: 'bg-green-100 text-green-600 dark:bg-green-900/30 dark:text-green-400',
+  useEffect(() => {
+    if (!currentOrg) return;
+    orgSettingsApi
+      .getHealth(currentOrg.id)
+      .then(setReport)
+      .catch((err) => setError(errorMessage(err)));
+  }, [currentOrg]);
+
+  const scan = async () => {
+    const key = getOrgKey();
+    if (!currentOrg || !key) return;
+    setScanning(true);
+    setError(null);
+    try {
+      const { secrets } = await secretsApi.export(currentOrg.id);
+      const weak: LocalReport['weak'] = [];
+      const byHash = new Map<string, Array<{ id: string; name: string }>>();
+      let checked = 0;
+      for (const s of secrets) {
+        const payload = await decryptSecretPayload(s, key, currentOrg.id, s.id).catch(() => null);
+        if (!payload?.password) continue;
+        checked++;
+        const strength = assessPassword(payload.password);
+        if (strength.score < 2) weak.push({ id: s.id, name: s.name, label: strength.label });
+        const h = await sha256Hex(payload.password);
+        byHash.set(h, [...(byHash.get(h) ?? []), { id: s.id, name: s.name }]);
+      }
+      const reused = [...byHash.values()].filter((g) => g.length > 1).map((g) => ({ names: g.map((x) => x.name), ids: g.map((x) => x.id) }));
+      setLocal({ weak, reused, checked });
+    } catch (err) {
+      setError(errorMessage(err, 'Could not run the check'));
+    } finally {
+      setScanning(false);
+    }
   };
 
+  const open = (id: string) => navigate(`/?secret=${id}`);
+
   return (
-    <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-4">
-      <div className="flex items-center gap-3">
-        <div className={`p-2 rounded-lg ${colorClasses[color]}`}>{icon}</div>
-        <div>
-          <p className="text-2xl font-bold text-gray-900 dark:text-gray-100">{count}</p>
-          <p className="text-sm font-medium text-gray-700 dark:text-gray-300">{title}</p>
-          <p className="text-xs text-gray-500 dark:text-gray-400">{description}</p>
-        </div>
-      </div>
+    <div className="space-y-6">
+      <PageHeader title="Password health" description={currentOrg?.name} />
+      {error && <Alert tone="error">{error}</Alert>}
+
+      {!report ? (
+        !error && <Spinner />
+      ) : (
+        <>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <Stat label="Health score" value={`${report.healthScore}%`} tone={report.healthScore >= 80 ? 'green' : report.healthScore >= 50 ? 'amber' : 'red'} />
+            <Stat label="Expired" value={report.metrics.expired} tone={report.metrics.expired ? 'red' : undefined} />
+            <Stat label="Expiring within 30 days" value={report.metrics.expiringSoon} tone={report.metrics.expiringSoon ? 'amber' : undefined} />
+            <Stat label="Not changed in 90+ days" value={report.metrics.oldPasswords} />
+          </div>
+
+          <div className="grid gap-6 lg:grid-cols-2">
+            <Card title="Expiring and expired">
+              {report.expiringSecrets.length === 0 ? (
+                <p className="text-sm text-gray-500">Nothing is expiring soon.</p>
+              ) : (
+                <ul className="divide-y divide-gray-200 text-sm dark:divide-gray-700">
+                  {report.expiringSecrets.map((s) => (
+                    <li key={s.id} className="flex justify-between py-2">
+                      <Link to={`/?secret=${s.id}`} className="font-medium text-vault-700 hover:underline dark:text-vault-300">
+                        {s.name}
+                      </Link>
+                      <span className={s.daysUntilExpiry < 0 ? 'text-red-600' : 'text-amber-600'}>
+                        {s.daysUntilExpiry < 0 ? `${-s.daysUntilExpiry} days ago` : `in ${s.daysUntilExpiry} days`}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Card>
+            <Card title="Oldest passwords">
+              {report.oldPasswords.length === 0 ? (
+                <p className="text-sm text-gray-500">Every login was updated in the last 90 days.</p>
+              ) : (
+                <ul className="divide-y divide-gray-200 text-sm dark:divide-gray-700">
+                  {report.oldPasswords.map((s) => (
+                    <li key={s.id} className="flex justify-between py-2">
+                      <Link to={`/?secret=${s.id}`} className="font-medium text-vault-700 hover:underline dark:text-vault-300">
+                        {s.name}
+                      </Link>
+                      <span className="text-gray-500">{s.daysSinceUpdate} days</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Card>
+          </div>
+        </>
+      )}
+
+      <Card
+        title="Weak and reused passwords"
+        description="Decrypts every login in this browser to check strength and reuse. Nothing leaves your device; the audit log records it as an export."
+        actions={
+          <Button variant="secondary" loading={scanning} onClick={() => void scan()}>
+            {local ? 'Check again' : 'Run check'}
+          </Button>
+        }
+      >
+        {local && (
+          <div className="space-y-4 text-sm">
+            <p className="text-gray-600 dark:text-gray-400">Checked {local.checked} passwords.</p>
+            <div>
+              <h3 className="font-medium text-gray-900 dark:text-white">Weak ({local.weak.length})</h3>
+              <ul className="mt-1 space-y-1">
+                {local.weak.map((w) => (
+                  <li key={w.id}>
+                    <button className="text-vault-700 hover:underline dark:text-vault-300" onClick={() => open(w.id)}>
+                      {w.name}
+                    </button>{' '}
+                    <span className="text-gray-500">({w.label.toLowerCase()})</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+            <div>
+              <h3 className="font-medium text-gray-900 dark:text-white">Reused ({local.reused.length} groups)</h3>
+              <ul className="mt-1 space-y-1">
+                {local.reused.map((g, i) => (
+                  <li key={i} className="text-gray-700 dark:text-gray-300">
+                    Same password: {g.names.join(', ')}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+      </Card>
     </div>
   );
 }

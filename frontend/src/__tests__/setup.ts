@@ -5,14 +5,11 @@
  */
 
 import '@testing-library/jest-dom';
-import { vi } from 'vitest';
+import { afterEach, vi } from 'vitest';
 
-// Mock crypto.subtle for Node.js test environment
-if (typeof globalThis.crypto === 'undefined') {
-  const { webcrypto } = await import('node:crypto');
-  globalThis.crypto = webcrypto as Crypto;
-}
 
+// Browser API stubs, only in the jsdom environment (library tests run in node).
+if (typeof window !== 'undefined') {
 // Mock window.matchMedia for theme tests
 Object.defineProperty(window, 'matchMedia', {
   writable: true,
@@ -69,7 +66,6 @@ window.ResizeObserver = ResizeObserverMock;
 
 // Mock IntersectionObserver
 class IntersectionObserverMock {
-  constructor(callback: IntersectionObserverCallback) {}
   observe() {}
   unobserve() {}
   disconnect() {}
@@ -77,14 +73,16 @@ class IntersectionObserverMock {
 window.IntersectionObserver = IntersectionObserverMock as unknown as typeof IntersectionObserver;
 
 // Mock scrollTo
-window.scrollTo = vi.fn();
+window.scrollTo = vi.fn() as unknown as typeof window.scrollTo;
 
-// Mock focus
-HTMLElement.prototype.focus = vi.fn();
+
+}
 
 // Clean up after each test
 afterEach(() => {
   vi.clearAllMocks();
-  localStorageMock.clear();
-  document.documentElement.classList.remove('dark', 'light');
+  if (typeof window !== 'undefined') {
+    window.localStorage.clear();
+    document.documentElement.classList.remove('dark', 'light');
+  }
 });

@@ -1,21 +1,53 @@
 /**
- * CloudVault API Client
- * 
- * Handles all communication with the Cloudflare Workers backend.
- * 
- * @module lib/api
+ * CloudVault API client.
+ *
+ * All requests go through `request()`, which attaches the session token,
+ * parses errors into ApiError, and announces ended sessions so the app can
+ * return to the login screen.
+ *
+ * The API base URL comes from VITE_API_URL (for a Worker on another domain)
+ * and defaults to /api (same origin, or the Vite dev proxy).
  */
 
-/**
- * API base URL
- * - Uses VITE_API_URL if set (for custom API servers)
- * - Falls back to '/api' (works with Cloudflare Pages proxy)
- */
-const API_BASE = import.meta.env.VITE_API_URL || '/api';
+import type { EncryptedSecret } from './crypto';
+
+export const API_BASE = (import.meta.env.VITE_API_URL || '/api').replace(/\/$/, '');
+
+const TOKEN_KEY = 'cloudvault_token';
+
+/** Fired on window when the server says the session is over. */
+export const SESSION_ENDED_EVENT = 'cloudvault:session-ended';
+
+export const tokenStore = {
+  get(): string | null {
+    try {
+      return localStorage.getItem(TOKEN_KEY);
+    } catch {
+      return null;
+    }
+  },
+  set(token: string): void {
+    try {
+      localStorage.setItem(TOKEN_KEY, token);
+    } catch {
+      // storage unavailable: the session lasts for this page only
+    }
+  },
+  clear(): void {
+    try {
+      localStorage.removeItem(TOKEN_KEY);
+    } catch {
+      // ignore
+    }
+  },
+};
 
 // ============================================
-// TYPE DEFINITIONS
+// TYPES
 // ============================================
+
+export type Role = 'admin' | 'member' | 'read_only';
+export type SecretType = 'password' | 'note' | 'api_key' | 'card' | 'totp';
 
 export interface User {
   id: string;
@@ -24,38 +56,78 @@ export interface User {
   publicKey: string | null;
   encryptedPrivateKey: string | null;
   salt: string | null;
+  kdfIterations: number;
   authProvider: 'github' | 'magic_link';
   createdAt: string;
+}
+
+export interface LoginResponse {
+  token: string;
+  expiresAt: number;
+  user: User;
+  needsKeySetup: boolean;
 }
 
 export interface Organization {
   id: string;
   name: string;
-  role: 'admin' | 'member' | 'read_only';
+  role: Role;
   encryptedOrgKey: string;
+  keyVersion: number;
   createdAt: string;
 }
 
-export type SecretType = 'password' | 'note' | 'api_key' | 'card' | 'totp';
+export interface OrganizationList {
+  organizations: Organization[];
+  pendingInvites: Array<{ id: string; name: string }>;
+}
 
-export interface Secret {
+/** Secret metadata, as returned by the list endpoint (no ciphertext). */
+export interface SecretMeta {
   id: string;
   orgId: string;
   name: string;
   url: string | null;
   usernameHint: string | null;
-  ciphertextBlob: string;
-  iv: string;
   version: number;
-  createdBy: string;
+  createdBy: string | null;
   updatedAt: string;
   categoryId: string | null;
+  categoryName: string | null;
+  categoryColor: string | null;
   isFavorite: boolean;
   secretType: SecretType;
   expiresAt: string | null;
   tags: string[];
-  categoryName?: string | null;
-  categoryColor?: string | null;
+}
+
+/** A secret with its ciphertext (single fetch, export, create, update). */
+export interface Secret extends SecretMeta {
+  ciphertextBlob: string;
+  iv: string;
+  encVersion: 1 | 2;
+}
+
+export interface SecretInput {
+  name: string;
+  url?: string;
+  usernameHint?: string;
+  categoryId?: string | null;
+  secretType?: SecretType;
+  tags?: string[];
+  expiresAt?: string | null;
+}
+
+export interface SecretHistory {
+  id: number;
+  secretId: string;
+  version: number;
+  ciphertextBlob: string;
+  iv: string;
+  encVersion: 1 | 2;
+  changedBy: string | null;
+  changedByEmail: string | null;
+  createdAt: string;
 }
 
 export interface Category {
@@ -77,466 +149,32 @@ export interface UserPreferences {
   compactView: boolean;
 }
 
-export interface SecretHistory {
-  id: number;
-  secretId: string;
-  version: number;
-  ciphertextBlob: string;
-  iv: string;
-  changedBy: string;
-  changedByEmail: string;
-  createdAt: string;
-}
-
 export interface AuditLogEntry {
   id: number;
-  orgId: string;
-  userId: string;
-  userEmail: string;
+  orgId: string | null;
+  userId: string | null;
+  userEmail: string | null;
   action: string;
   targetType: string | null;
   targetId: string | null;
   targetName: string | null;
-  metadata: string | null;
+  metadata: Record<string, unknown> | null;
   ipAddress: string | null;
+  userAgent: string | null;
   timestamp: string;
 }
 
 export interface Membership {
   userId: string;
   orgId: string;
-  role: 'admin' | 'member' | 'read_only';
-  encryptedOrgKey: string | null;
+  role: Role;
   status: 'pending' | 'active';
   userEmail: string;
   userName: string | null;
   userPublicKey: string | null;
+  hasKeys: boolean;
   createdAt: string;
 }
-
-// ============================================
-// API HELPERS
-// ============================================
-
-class ApiError extends Error {
-  constructor(public status: number, message: string) {
-    super(message);
-    this.name = 'ApiError';
-  }
-}
-
-async function fetchApi<T>(
-  endpoint: string,
-  options: RequestInit = {}
-): Promise<T> {
-  const token = localStorage.getItem('cloudvault_token');
-  
-  const headers: HeadersInit = {
-    'Content-Type': 'application/json',
-    ...options.headers,
-  };
-  
-  if (token) {
-    (headers as Record<string, string>)['Authorization'] = `Bearer ${token}`;
-  }
-  
-  const response = await fetch(`${API_BASE}${endpoint}`, {
-    ...options,
-    headers,
-  });
-  
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ message: 'Request failed' }));
-    throw new ApiError(response.status, error.message || 'Request failed');
-  }
-  
-  return response.json();
-}
-
-// ============================================
-// AUTH API
-// ============================================
-
-export const authApi = {
-  /**
-   * Get GitHub OAuth URL
-   */
-  getGithubAuthUrl(): string {
-    return `${API_BASE}/auth/github`;
-  },
-
-  /**
-   * Exchange GitHub code for token
-   */
-  async githubCallback(code: string): Promise<{ token: string; user: User; isNewUser: boolean }> {
-    return fetchApi('/auth/github/callback', {
-      method: 'POST',
-      body: JSON.stringify({ code }),
-    });
-  },
-
-  /**
-   * Request magic link
-   */
-  async requestMagicLink(email: string): Promise<{ message: string }> {
-    return fetchApi('/auth/magic-link', {
-      method: 'POST',
-      body: JSON.stringify({ email }),
-    });
-  },
-
-  /**
-   * Verify magic link token
-   */
-  async verifyMagicLink(token: string): Promise<{ token: string; user: User; isNewUser: boolean }> {
-    return fetchApi('/auth/magic-link/verify', {
-      method: 'POST',
-      body: JSON.stringify({ token }),
-    });
-  },
-
-  /**
-   * Get current user
-   */
-  async getCurrentUser(): Promise<User> {
-    return fetchApi('/auth/me');
-  },
-
-  /**
-   * Setup user keys (first time login)
-   */
-  async setupKeys(data: {
-    publicKey: string;
-    encryptedPrivateKey: string;
-    salt: string;
-  }): Promise<User> {
-    return fetchApi('/auth/setup-keys', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
-  },
-
-  /**
-   * Logout
-   */
-  logout(): void {
-    localStorage.removeItem('cloudvault_token');
-  },
-};
-
-// ============================================
-// ORGANIZATIONS API
-// ============================================
-
-export const orgsApi = {
-  /**
-   * List user's organizations
-   */
-  async list(): Promise<Organization[]> {
-    return fetchApi('/organizations');
-  },
-
-  /**
-   * Create a new organization
-   */
-  async create(data: { name: string; encryptedOrgKey: string }): Promise<Organization> {
-    return fetchApi('/organizations', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
-  },
-
-  /**
-   * Get organization members
-   */
-  async getMembers(orgId: string): Promise<Membership[]> {
-    return fetchApi(`/organizations/${orgId}/members`);
-  },
-
-  /**
-   * Invite a user to the organization
-   */
-  async inviteUser(orgId: string, email: string): Promise<Membership> {
-    return fetchApi(`/organizations/${orgId}/members`, {
-      method: 'POST',
-      body: JSON.stringify({ email }),
-    });
-  },
-
-  /**
-   * Approve pending user and grant access
-   */
-  async approveUser(
-    orgId: string,
-    userId: string,
-    encryptedOrgKey: string
-  ): Promise<Membership> {
-    return fetchApi(`/organizations/${orgId}/members/${userId}/approve`, {
-      method: 'POST',
-      body: JSON.stringify({ encryptedOrgKey }),
-    });
-  },
-
-  /**
-   * Remove user from organization
-   */
-  async removeUser(orgId: string, userId: string): Promise<void> {
-    return fetchApi(`/organizations/${orgId}/members/${userId}`, {
-      method: 'DELETE',
-    });
-  },
-
-  /**
-   * Update user role
-   */
-  async updateRole(
-    orgId: string,
-    userId: string,
-    role: 'admin' | 'member' | 'read_only'
-  ): Promise<Membership> {
-    return fetchApi(`/organizations/${orgId}/members/${userId}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ role }),
-    });
-  },
-};
-
-// ============================================
-// SECRETS API
-// ============================================
-
-export const secretsApi = {
-  /**
-   * List secrets in an organization with optional filters
-   */
-  async list(
-    orgId: string,
-    options?: {
-      categoryId?: string;
-      type?: SecretType;
-      favorites?: boolean;
-      search?: string;
-    }
-  ): Promise<Secret[]> {
-    const params = new URLSearchParams();
-    if (options?.categoryId) params.set('categoryId', options.categoryId);
-    if (options?.type) params.set('type', options.type);
-    if (options?.favorites) params.set('favorites', 'true');
-    if (options?.search) params.set('search', options.search);
-    const query = params.toString();
-    return fetchApi(`/organizations/${orgId}/secrets${query ? `?${query}` : ''}`);
-  },
-
-  /**
-   * Get a single secret
-   */
-  async get(orgId: string, secretId: string): Promise<Secret> {
-    return fetchApi(`/organizations/${orgId}/secrets/${secretId}`);
-  },
-
-  /**
-   * Create a new secret
-   */
-  async create(
-    orgId: string,
-    data: {
-      name: string;
-      url?: string;
-      usernameHint?: string;
-      ciphertextBlob: string;
-      iv: string;
-      categoryId?: string | null;
-      secretType?: SecretType;
-      tags?: string[];
-      expiresAt?: string | null;
-    }
-  ): Promise<Secret> {
-    return fetchApi(`/organizations/${orgId}/secrets`, {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
-  },
-
-  /**
-   * Update a secret
-   */
-  async update(
-    orgId: string,
-    secretId: string,
-    data: {
-      name?: string;
-      url?: string;
-      usernameHint?: string;
-      ciphertextBlob?: string;
-      iv?: string;
-      categoryId?: string | null;
-      secretType?: SecretType;
-      tags?: string[];
-      expiresAt?: string | null;
-      isFavorite?: boolean;
-    }
-  ): Promise<Secret> {
-    return fetchApi(`/organizations/${orgId}/secrets/${secretId}`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    });
-  },
-
-  /**
-   * Toggle favorite status
-   */
-  async toggleFavorite(orgId: string, secretId: string, isFavorite: boolean): Promise<{ success: boolean; isFavorite: boolean }> {
-    return fetchApi(`/organizations/${orgId}/secrets/${secretId}/favorite`, {
-      method: 'PATCH',
-      body: JSON.stringify({ isFavorite }),
-    });
-  },
-
-  /**
-   * Delete a secret
-   */
-  async delete(orgId: string, secretId: string): Promise<void> {
-    return fetchApi(`/organizations/${orgId}/secrets/${secretId}`, {
-      method: 'DELETE',
-    });
-  },
-
-  /**
-   * Get secret history
-   */
-  async getHistory(orgId: string, secretId: string): Promise<SecretHistory[]> {
-    return fetchApi(`/organizations/${orgId}/secrets/${secretId}/history`);
-  },
-
-  /**
-   * Get expiring secrets (within 30 days)
-   */
-  async getExpiring(orgId: string): Promise<Secret[]> {
-    return fetchApi(`/organizations/${orgId}/secrets/expiring`);
-  },
-};
-
-// ============================================
-// CATEGORIES API
-// ============================================
-
-export const categoriesApi = {
-  /**
-   * List categories in an organization
-   */
-  async list(orgId: string): Promise<Category[]> {
-    return fetchApi(`/organizations/${orgId}/categories`);
-  },
-
-  /**
-   * Create a new category
-   */
-  async create(
-    orgId: string,
-    data: { name: string; icon?: string; color?: string }
-  ): Promise<Category> {
-    return fetchApi(`/organizations/${orgId}/categories`, {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
-  },
-
-  /**
-   * Update a category
-   */
-  async update(
-    orgId: string,
-    categoryId: string,
-    data: { name?: string; icon?: string; color?: string; sortOrder?: number }
-  ): Promise<Category> {
-    return fetchApi(`/organizations/${orgId}/categories/${categoryId}`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    });
-  },
-
-  /**
-   * Delete a category
-   */
-  async delete(orgId: string, categoryId: string): Promise<void> {
-    return fetchApi(`/organizations/${orgId}/categories/${categoryId}`, {
-      method: 'DELETE',
-    });
-  },
-};
-
-// ============================================
-// PREFERENCES API
-// ============================================
-
-export const preferencesApi = {
-  /**
-   * Get user preferences
-   */
-  async get(): Promise<UserPreferences> {
-    return fetchApi('/preferences');
-  },
-
-  /**
-   * Update user preferences
-   */
-  async update(data: Partial<UserPreferences>): Promise<UserPreferences> {
-    return fetchApi('/preferences', {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    });
-  },
-};
-
-// ============================================
-// AUDIT API
-// ============================================
-
-export const auditApi = {
-  /**
-   * Get audit logs for an organization
-   */
-  async list(
-    orgId: string,
-    options?: {
-      limit?: number;
-      offset?: number;
-      action?: string;
-      userId?: string;
-    }
-  ): Promise<{ logs: AuditLogEntry[]; total: number }> {
-    const params = new URLSearchParams();
-    if (options?.limit) params.set('limit', options.limit.toString());
-    if (options?.offset) params.set('offset', options.offset.toString());
-    if (options?.action) params.set('action', options.action);
-    if (options?.userId) params.set('userId', options.userId);
-    
-    const query = params.toString();
-    return fetchApi(`/organizations/${orgId}/audit${query ? `?${query}` : ''}`);
-  },
-
-  /**
-   * Export audit logs as CSV
-   */
-  async exportCsv(orgId: string): Promise<Blob> {
-    const token = localStorage.getItem('cloudvault_token');
-    const response = await fetch(`${API_BASE}/organizations/${orgId}/audit/export`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
-    
-    if (!response.ok) {
-      throw new ApiError(response.status, 'Export failed');
-    }
-    
-    return response.blob();
-  },
-};
-
-// ============================================
-// SHARING API
-// ============================================
 
 export interface ShareLink {
   id: string;
@@ -545,60 +183,37 @@ export interface ShareLink {
   maxViews: number;
   viewCount: number;
   allowCopy: boolean;
-  recipientEmail?: string;
+  recipientEmail: string | null;
   isRevoked: boolean;
-  isExpired: boolean;
-  isExhausted: boolean;
+  isExpired?: boolean;
+  isExhausted?: boolean;
   hasPassword: boolean;
-  createdAt: string;
-  lastViewedAt?: string;
-  createdByEmail: string;
+  createdAt?: string;
+  lastViewedAt?: string | null;
+  createdByEmail?: string | null;
 }
 
-export const sharingApi = {
-  /**
-   * Create a share link for a secret
-   */
-  async create(
-    orgId: string,
-    secretId: string,
-    data: {
-      expiresInHours: number;
-      maxViews?: number;
-      accessPassword?: string;
-      allowCopy?: boolean;
-      recipientEmail?: string;
-    }
-  ): Promise<ShareLink> {
-    return fetchApi(`/organizations/${orgId}/secrets/${secretId}/share`, {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
-  },
+export interface PublicShareInfo {
+  secretName: string;
+  orgName: string;
+  requiresPassword: boolean;
+  accessSalt: string | null;
+  allowCopy: boolean;
+  expiresAt: string;
+  remainingViews: number | null;
+}
 
-  /**
-   * List share links for a secret
-   */
-  async list(orgId: string, secretId: string): Promise<ShareLink[]> {
-    return fetchApi(`/organizations/${orgId}/secrets/${secretId}/shares`);
-  },
-
-  /**
-   * Revoke a share link
-   */
-  async revoke(orgId: string, linkId: string): Promise<void> {
-    return fetchApi(`/organizations/${orgId}/shares/${linkId}`, {
-      method: 'DELETE',
-    });
-  },
-};
-
-// ============================================
-// ORGANIZATION SETTINGS API
-// ============================================
+export interface PublicShareContent {
+  name: string;
+  url: string | null;
+  secretType: SecretType;
+  ciphertextBlob: string;
+  iv: string;
+  allowCopy: boolean;
+  remainingViews: number | null;
+}
 
 export interface OrgSettings {
-  require2fa: boolean;
   minPasswordLength: number;
   passwordExpiryDays: number;
   allowShareLinks: boolean;
@@ -611,124 +226,285 @@ export interface OrgSettings {
 export interface HealthReport {
   healthScore: number;
   totalSecrets: number;
-  metrics: {
-    expiringSoon: number;
-    expired: number;
-    oldPasswords: number;
-  };
-  expiringSecrets: Array<{
-    id: string;
-    name: string;
-    expiresAt: string;
-    secretType: string;
-    daysUntilExpiry: number;
-  }>;
-  oldPasswords: Array<{
-    id: string;
-    name: string;
-    lastUpdated: string;
-    daysSinceUpdate: number;
-  }>;
+  metrics: { expiringSoon: number; expired: number; oldPasswords: number };
+  expiringSecrets: Array<{ id: string; name: string; expiresAt: string; secretType: SecretType; daysUntilExpiry: number }>;
+  oldPasswords: Array<{ id: string; name: string; lastUpdated: string; daysSinceUpdate: number }>;
 }
-
-export const orgSettingsApi = {
-  /**
-   * Get organization settings
-   */
-  async get(orgId: string): Promise<OrgSettings> {
-    return fetchApi(`/organizations/${orgId}/settings`);
-  },
-
-  /**
-   * Update organization settings
-   */
-  async update(orgId: string, data: Partial<OrgSettings>): Promise<OrgSettings> {
-    return fetchApi(`/organizations/${orgId}/settings`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    });
-  },
-
-  /**
-   * Get password health report
-   */
-  async getHealth(orgId: string): Promise<HealthReport> {
-    return fetchApi(`/organizations/${orgId}/health`);
-  },
-};
-
-// ============================================
-// EMERGENCY ACCESS API
-// ============================================
 
 export interface EmergencyContact {
   id: string;
-  userId: string;
-  userEmail: string;
-  userName?: string;
   contactEmail: string;
-  contactName?: string;
+  contactName: string | null;
+  contactUserId: string;
   waitTimeHours: number;
-  createdAt: string;
+  createdByEmail?: string | null;
+  createdAt?: string;
 }
 
 export interface EmergencyRequest {
   id: string;
   requestedAt: string;
   grantAt: string;
-  status: 'pending' | 'approved' | 'denied' | 'expired';
-  reason: string;
+  status: 'pending' | 'approved' | 'denied' | 'granted' | 'expired';
+  reason: string | null;
   contactEmail: string;
-  contactName?: string;
+  contactName: string | null;
   waitTimeHours: number;
-  userEmail: string;
-  userName?: string;
-  canDeny: boolean;
+  resolvedAt: string | null;
+  resolvedByEmail: string | null;
+  canRespond: boolean;
 }
 
-export const emergencyApi = {
-  /**
-   * List emergency contacts for the organization
-   */
-  async listContacts(orgId: string): Promise<EmergencyContact[]> {
-    return fetchApi(`/organizations/${orgId}/emergency-contacts`);
-  },
+export interface EmergencyAccessEntry {
+  contactId: string;
+  orgId: string;
+  orgName: string;
+  waitTimeHours: number;
+  request: { id: string; status: EmergencyRequest['status']; requestedAt: string; grantAt: string } | null;
+}
 
-  /**
-   * Add an emergency contact
-   */
-  async addContact(
+export interface KeyRotationData {
+  keyVersion: number;
+  secrets: Array<{ id: string; ciphertextBlob: string; iv: string; encVersion: 1 | 2 }>;
+  history: Array<{ id: number; secretId: string; ciphertextBlob: string; iv: string; encVersion: 1 | 2 }>;
+  members: Array<{ userId: string; email: string; publicKey: string }>;
+  emergencyContacts: Array<{ contactId: string; email: string; publicKey: string }>;
+}
+
+// ============================================
+// CORE
+// ============================================
+
+export class ApiError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+    public code?: string,
+    public details?: Record<string, unknown>
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+const SESSION_CODES = new Set(['SESSION_TIMEOUT', 'SESSION_ENDED']);
+
+async function request<T>(endpoint: string, options: RequestInit & { json?: unknown; raw?: boolean } = {}): Promise<T> {
+  const { json, raw, ...init } = options;
+  const headers = new Headers(init.headers);
+  const token = tokenStore.get();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  if (json !== undefined) headers.set('Content-Type', 'application/json');
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${endpoint}`, {
+      ...init,
+      headers,
+      body: json !== undefined ? JSON.stringify(json) : init.body,
+    });
+  } catch {
+    throw new ApiError(0, 'Could not reach the server. Check your connection.');
+  }
+
+  if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as { error?: string; code?: string } & Record<string, unknown>;
+    const error = new ApiError(response.status, body.error || `Request failed (${response.status})`, body.code, body);
+    // 401s from public endpoints (wrong share password) say nothing about our session.
+    const sessionEnded = SESSION_CODES.has(body.code ?? '') || (!body.code && !endpoint.startsWith('/share/') && endpoint !== '/auth/logout');
+    if (response.status === 401 && token && sessionEnded) {
+      window.dispatchEvent(new CustomEvent(SESSION_ENDED_EVENT, { detail: { code: body.code } }));
+    }
+    throw error;
+  }
+
+  if (raw) return response as unknown as T;
+  if (response.status === 204) return undefined as T;
+  return response.json() as Promise<T>;
+}
+
+const org = (orgId: string) => `/organizations/${encodeURIComponent(orgId)}`;
+
+// ============================================
+// AUTH
+// ============================================
+
+export const authApi = {
+  /** Full URL to start GitHub OAuth with the given state. */
+  githubAuthUrl(state: string): string {
+    return `${API_BASE}/auth/github?state=${encodeURIComponent(state)}`;
+  },
+  githubCallback: (code: string) => request<LoginResponse>('/auth/github/callback', { method: 'POST', json: { code } }),
+  requestMagicLink: (email: string) => request<{ message: string }>('/auth/magic-link', { method: 'POST', json: { email } }),
+  verifyMagicLink: (token: string) => request<LoginResponse>('/auth/magic-link/verify', { method: 'POST', json: { token } }),
+  getCurrentUser: () => request<User>('/auth/me'),
+  updateProfile: (name: string | null) => request<User>('/auth/me', { method: 'PATCH', json: { name } }),
+  setupKeys: (data: { publicKey: string; encryptedPrivateKey: string; salt: string; kdfIterations: number }) =>
+    request<User>('/auth/setup-keys', { method: 'POST', json: data }),
+  changeMasterPassword: (data: { encryptedPrivateKey: string; salt: string; kdfIterations: number }) =>
+    request<User>('/auth/keys', { method: 'PUT', json: data }),
+  async logout(): Promise<void> {
+    try {
+      await request('/auth/logout', { method: 'POST' });
+    } catch {
+      // The local session is cleared regardless.
+    } finally {
+      tokenStore.clear();
+    }
+  },
+  logoutAll: () => request<{ sessionsRevoked: number }>('/auth/logout-all', { method: 'POST' }),
+};
+
+// ============================================
+// ORGANIZATIONS AND MEMBERS
+// ============================================
+
+export const orgsApi = {
+  list: () => request<OrganizationList>('/organizations'),
+  create: (data: { name: string; encryptedOrgKey: string }) => request<Organization>('/organizations', { method: 'POST', json: data }),
+  rename: (orgId: string, name: string) => request<{ name: string }>(org(orgId), { method: 'PATCH', json: { name } }),
+  delete: (orgId: string) => request<{ success: boolean }>(org(orgId), { method: 'DELETE' }),
+  leave: (orgId: string) => request<{ success: boolean }>(`${org(orgId)}/leave`, { method: 'POST' }),
+  getMembers: (orgId: string) => request<Membership[]>(`${org(orgId)}/members`),
+  inviteUser: (orgId: string, email: string, role: Role = 'member') =>
+    request<Membership & { invitationEmailed: boolean }>(`${org(orgId)}/members`, { method: 'POST', json: { email, role } }),
+  approveUser: (orgId: string, userId: string, encryptedOrgKey: string) =>
+    request<Membership>(`${org(orgId)}/members/${userId}/approve`, { method: 'POST', json: { encryptedOrgKey } }),
+  updateRole: (orgId: string, userId: string, role: Role) =>
+    request<{ role: Role }>(`${org(orgId)}/members/${userId}`, { method: 'PATCH', json: { role } }),
+  removeUser: (orgId: string, userId: string) =>
+    request<{ recommendKeyRotation: boolean }>(`${org(orgId)}/members/${userId}`, { method: 'DELETE' }),
+  getKeyRotationData: (orgId: string) => request<KeyRotationData>(`${org(orgId)}/key-rotation`),
+  commitKeyRotation: (
     orgId: string,
-    data: { contactEmail: string; contactName?: string; waitTimeHours: number }
-  ): Promise<EmergencyContact> {
-    return fetchApi(`/organizations/${orgId}/emergency-contacts`, {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
-  },
+    data: {
+      fromKeyVersion: number;
+      secrets: Array<{ id: string } & EncryptedSecret>;
+      history: Array<{ id: number } & EncryptedSecret>;
+      memberKeys: Array<{ userId: string; encryptedOrgKey: string }>;
+      emergencyKeys: Array<{ contactId: string; encryptedOrgKey: string }>;
+    }
+  ) => request<{ keyVersion: number }>(`${org(orgId)}/key-rotation`, { method: 'POST', json: data }),
+};
 
-  /**
-   * Remove an emergency contact
-   */
-  async removeContact(orgId: string, contactId: string): Promise<void> {
-    return fetchApi(`/organizations/${orgId}/emergency-contacts/${contactId}`, {
-      method: 'DELETE',
-    });
-  },
+// ============================================
+// SECRETS
+// ============================================
 
-  /**
-   * List emergency access requests
-   */
-  async listRequests(orgId: string): Promise<EmergencyRequest[]> {
-    return fetchApi(`/organizations/${orgId}/emergency-requests`);
-  },
+export const secretsApi = {
+  list: (orgId: string) => request<SecretMeta[]>(`${org(orgId)}/secrets`),
+  /** Fetch one secret with ciphertext. Recorded as a view in the audit log. */
+  get: (orgId: string, secretId: string) => request<Secret>(`${org(orgId)}/secrets/${secretId}`),
+  create: (orgId: string, data: SecretInput & EncryptedSecret & { id: string }) =>
+    request<Secret>(`${org(orgId)}/secrets`, { method: 'POST', json: data }),
+  update: (orgId: string, secretId: string, data: Partial<SecretInput> & Partial<EncryptedSecret> & { expectedVersion?: number }) =>
+    request<Secret>(`${org(orgId)}/secrets/${secretId}`, { method: 'PUT', json: data }),
+  delete: (orgId: string, secretId: string) => request<{ success: boolean }>(`${org(orgId)}/secrets/${secretId}`, { method: 'DELETE' }),
+  toggleFavorite: (orgId: string, secretId: string, isFavorite: boolean) =>
+    request<{ isFavorite: boolean }>(`${org(orgId)}/secrets/${secretId}/favorite`, { method: 'PATCH', json: { isFavorite } }),
+  getHistory: (orgId: string, secretId: string) => request<SecretHistory[]>(`${org(orgId)}/secrets/${secretId}/history`),
+  export: (orgId: string) => request<{ version: string; exportedAt: string; orgId: string; secrets: Secret[] }>(`${org(orgId)}/secrets/export`),
+  import: (orgId: string, secrets: Array<SecretInput & EncryptedSecret & { id: string }>, categoryId?: string | null) =>
+    request<{ imported: number; ids: string[] }>(`${org(orgId)}/secrets/import`, { method: 'POST', json: { secrets, categoryId } }),
+};
 
-  /**
-   * Deny an emergency access request
-   */
-  async denyRequest(orgId: string, requestId: string): Promise<void> {
-    return fetchApi(`/organizations/${orgId}/emergency-requests/${requestId}/deny`, {
-      method: 'POST',
-    });
+// ============================================
+// CATEGORIES
+// ============================================
+
+export const categoriesApi = {
+  list: (orgId: string) => request<Category[]>(`${org(orgId)}/categories`),
+  create: (orgId: string, data: { name: string; icon?: string; color?: string }) =>
+    request<Category>(`${org(orgId)}/categories`, { method: 'POST', json: data }),
+  update: (orgId: string, categoryId: string, data: Partial<{ name: string; icon: string; color: string; sortOrder: number }>) =>
+    request<Category>(`${org(orgId)}/categories/${categoryId}`, { method: 'PUT', json: data }),
+  delete: (orgId: string, categoryId: string) => request<{ success: boolean }>(`${org(orgId)}/categories/${categoryId}`, { method: 'DELETE' }),
+};
+
+// ============================================
+// PREFERENCES
+// ============================================
+
+export const preferencesApi = {
+  get: () => request<UserPreferences>('/preferences'),
+  update: (data: Partial<UserPreferences>) => request<UserPreferences>('/preferences', { method: 'PUT', json: data }),
+};
+
+// ============================================
+// AUDIT
+// ============================================
+
+export const auditApi = {
+  list: (orgId: string, params: { limit?: number; offset?: number; action?: string; userId?: string } = {}) => {
+    const query = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== '') query.set(k, String(v));
+    return request<{ logs: AuditLogEntry[]; total: number }>(`${org(orgId)}/audit?${query}`);
   },
+  async exportCsv(orgId: string): Promise<Blob> {
+    const response = await request<Response>(`${org(orgId)}/audit/export`, { raw: true });
+    return response.blob();
+  },
+};
+
+// ============================================
+// SHARING
+// ============================================
+
+export const sharingApi = {
+  create: (
+    orgId: string,
+    secretId: string,
+    data: {
+      id: string;
+      ciphertextBlob: string;
+      iv: string;
+      expiresInHours: number;
+      maxViews: number;
+      allowCopy: boolean;
+      recipientEmail?: string;
+      accessSalt?: string;
+      accessVerifier?: string;
+    }
+  ) => request<ShareLink>(`${org(orgId)}/secrets/${secretId}/shares`, { method: 'POST', json: data }),
+  list: (orgId: string, secretId: string) => request<ShareLink[]>(`${org(orgId)}/secrets/${secretId}/shares`),
+  revoke: (orgId: string, linkId: string) => request<{ success: boolean }>(`${org(orgId)}/shares/${linkId}`, { method: 'DELETE' }),
+  publicInfo: (linkId: string) => request<PublicShareInfo>(`/share/${encodeURIComponent(linkId)}`),
+  publicAccess: (linkId: string, accessToken?: string) =>
+    request<PublicShareContent>(`/share/${encodeURIComponent(linkId)}/access`, { method: 'POST', json: { accessToken } }),
+};
+
+// ============================================
+// ORG SETTINGS AND HEALTH
+// ============================================
+
+export const orgSettingsApi = {
+  get: (orgId: string) => request<OrgSettings>(`${org(orgId)}/settings`),
+  update: (orgId: string, data: Partial<OrgSettings>) => request<OrgSettings>(`${org(orgId)}/settings`, { method: 'PUT', json: data }),
+  getHealth: (orgId: string) => request<HealthReport>(`${org(orgId)}/health`),
+};
+
+// ============================================
+// EMERGENCY ACCESS
+// ============================================
+
+export const emergencyApi = {
+  listContacts: (orgId: string) => request<EmergencyContact[]>(`${org(orgId)}/emergency-contacts`),
+  lookupContact: (orgId: string, email: string) =>
+    request<{ userId: string; email: string; name: string | null; publicKey: string }>(
+      `${org(orgId)}/emergency-contacts/lookup?email=${encodeURIComponent(email)}`
+    ),
+  addContact: (orgId: string, data: { contactEmail: string; contactName?: string; waitTimeHours: number; encryptedOrgKey: string }) =>
+    request<EmergencyContact>(`${org(orgId)}/emergency-contacts`, { method: 'POST', json: data }),
+  removeContact: (orgId: string, contactId: string) =>
+    request<{ success: boolean }>(`${org(orgId)}/emergency-contacts/${contactId}`, { method: 'DELETE' }),
+  listRequests: (orgId: string) => request<EmergencyRequest[]>(`${org(orgId)}/emergency-requests`),
+  approveRequest: (orgId: string, requestId: string) =>
+    request<{ status: string }>(`${org(orgId)}/emergency-requests/${requestId}/approve`, { method: 'POST' }),
+  denyRequest: (orgId: string, requestId: string) =>
+    request<{ status: string }>(`${org(orgId)}/emergency-requests/${requestId}/deny`, { method: 'POST' }),
+  myAccess: () => request<EmergencyAccessEntry[]>('/emergency/access'),
+  requestAccess: (contactId: string, reason: string) =>
+    request<{ id: string; grantAt: string }>(`/emergency/access/${contactId}/request`, { method: 'POST', json: { reason } }),
+  claimAccess: (requestId: string) =>
+    request<{ orgId: string; role: Role }>(`/emergency/access/requests/${requestId}/claim`, { method: 'POST' }),
 };
