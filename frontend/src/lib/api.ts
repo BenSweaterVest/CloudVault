@@ -329,7 +329,14 @@ const org = (orgId: string) => `/organizations/${encodeURIComponent(orgId)}`;
 // AUTH
 // ============================================
 
+export interface AuthConfig {
+  github: boolean;
+  magicLink: boolean;
+  signupsAllowed: boolean;
+}
+
 export const authApi = {
+  config: () => request<AuthConfig>('/auth/config'),
   /** Full URL to start GitHub OAuth with the given state. */
   githubAuthUrl(state: string): string {
     return `${API_BASE}/auth/github?state=${encodeURIComponent(state)}`;

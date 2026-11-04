@@ -10,10 +10,10 @@ import type { Context } from 'hono';
 export interface Env {
   /** Cloudflare D1 SQLite database (all persistent state lives here) */
   DB: D1Database;
-  /** GitHub OAuth client ID */
-  GITHUB_CLIENT_ID: string;
+  /** GitHub OAuth client ID. Optional: without it, GitHub sign-in is hidden. */
+  GITHUB_CLIENT_ID?: string;
   /** GitHub OAuth client secret (Cloudflare secret) */
-  GITHUB_CLIENT_SECRET: string;
+  GITHUB_CLIENT_SECRET?: string;
   /** JWT signing secret, at least 32 characters (Cloudflare secret) */
   JWT_SECRET: string;
   /** Frontend URL, used for CORS, OAuth redirects and links in emails */

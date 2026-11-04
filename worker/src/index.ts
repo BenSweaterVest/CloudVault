@@ -36,11 +36,14 @@ export type { Env, Variables } from './env';
 
 export function validateEnv(env: Env): string[] {
   const problems: string[] = [];
-  const required: (keyof Env)[] = ['DB', 'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'JWT_SECRET', 'APP_URL'];
+  const required: (keyof Env)[] = ['DB', 'JWT_SECRET', 'APP_URL'];
   for (const key of required) {
     if (!env[key]) problems.push(`Missing required setting: ${key}`);
   }
   if (env.JWT_SECRET && env.JWT_SECRET.length < 32) problems.push('JWT_SECRET must be at least 32 characters');
+  if (!!env.GITHUB_CLIENT_ID !== !!env.GITHUB_CLIENT_SECRET) {
+    problems.push('Set both GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET, or neither');
+  }
   if (env.APP_URL) {
     try {
       new URL(env.APP_URL);

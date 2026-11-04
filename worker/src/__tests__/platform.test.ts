@@ -115,6 +115,15 @@ describe('platform', () => {
     expect(last).toBe(429);
   });
 
+  it('reports which sign-in methods are configured', async () => {
+    const withGitHub = createTestContext();
+    expect((await withGitHub.json('GET', '/api/auth/config')).body).toEqual({ github: true, magicLink: false, signupsAllowed: true });
+
+    const emailOnly = createTestContext({ GITHUB_CLIENT_ID: undefined, GITHUB_CLIENT_SECRET: undefined, RESEND_API_KEY: 're_x', ALLOW_SIGNUPS: 'false' });
+    expect((await emailOnly.json('GET', '/api/auth/config')).body).toEqual({ github: false, magicLink: true, signupsAllowed: false });
+    expect((await emailOnly.request('GET', '/api/auth/github?state=abcdefghijklmnopqrstuvwxyz')).status).toBe(503);
+  });
+
   it('sets security headers and returns JSON 404s', async () => {
     const ctx = createTestContext();
     const res = await ctx.request('GET', '/api/nope');

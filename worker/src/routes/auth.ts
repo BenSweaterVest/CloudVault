@@ -88,6 +88,27 @@ async function completeLogin(c: AppContext, user: UserRow, provider: string, isN
 }
 
 // ============================================
+// CONFIGURATION
+// ============================================
+
+/** Which sign-in methods this deployment offers (for the login screen). */
+authRoutes.get('/config', (c) => {
+  return c.json({
+    github: !!(c.env.GITHUB_CLIENT_ID && c.env.GITHUB_CLIENT_SECRET),
+    // Without Resend, links are only printed to the log, which is useful in development.
+    magicLink: !!c.env.RESEND_API_KEY || c.env.ENVIRONMENT !== 'production',
+    signupsAllowed: signupsAllowed(c),
+  });
+});
+
+function requireGitHub(c: AppContext): { clientId: string; clientSecret: string } {
+  if (!c.env.GITHUB_CLIENT_ID || !c.env.GITHUB_CLIENT_SECRET) {
+    throw new HttpError(503, 'GitHub sign-in is not configured on this server');
+  }
+  return { clientId: c.env.GITHUB_CLIENT_ID, clientSecret: c.env.GITHUB_CLIENT_SECRET };
+}
+
+// ============================================
 // GITHUB OAUTH
 // ============================================
 
@@ -99,13 +120,14 @@ async function completeLogin(c: AppContext, user: UserRow, provider: string, isN
  * stored one before exchanging the code, which prevents login CSRF.
  */
 authRoutes.get('/github', (c) => {
+  const { clientId } = requireGitHub(c);
   const state = c.req.query('state') ?? '';
   if (!/^[A-Za-z0-9_-]{16,128}$/.test(state)) {
     throw new HttpError(400, 'Missing or invalid state parameter');
   }
 
   const params = new URLSearchParams({
-    client_id: c.env.GITHUB_CLIENT_ID,
+    client_id: clientId,
     redirect_uri: `${new URL(c.env.APP_URL).origin}/auth/github/callback`,
     scope: 'read:user user:email',
     state,
@@ -115,14 +137,15 @@ authRoutes.get('/github', (c) => {
 });
 
 authRoutes.post('/github/callback', async (c) => {
+  const { clientId, clientSecret } = requireGitHub(c);
   const { code } = await validateBody(c, githubCallbackSchema);
 
   const tokenResponse = await fetch('https://github.com/login/oauth/access_token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({
-      client_id: c.env.GITHUB_CLIENT_ID,
-      client_secret: c.env.GITHUB_CLIENT_SECRET,
+      client_id: clientId,
+      client_secret: clientSecret,
       code,
     }),
   });

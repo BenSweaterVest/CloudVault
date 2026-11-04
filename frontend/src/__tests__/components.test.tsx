@@ -109,7 +109,14 @@ describe('LoginForm', () => {
   });
 
   it('requests a magic link and confirms', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ message: 'ok' }), { status: 200 })));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) =>
+        String(url).endsWith('/auth/config')
+          ? new Response(JSON.stringify({ github: false, magicLink: true, signupsAllowed: true }))
+          : new Response(JSON.stringify({ message: 'ok' }))
+      )
+    );
     render(
       <MemoryRouter>
         <AuthProvider>
@@ -120,6 +127,19 @@ describe('LoginForm', () => {
     await userEvent.type(await screen.findByLabelText('Email address'), 'me@example.org');
     await userEvent.click(screen.getByText('Email me a login link'));
     expect(await screen.findByText('Check your email')).toBeInTheDocument();
+  });
+
+  it('hides GitHub sign-in when the server has not configured it', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ github: false, magicLink: true, signupsAllowed: false }))));
+    render(
+      <MemoryRouter>
+        <AuthProvider>
+          <LoginForm />
+        </AuthProvider>
+      </MemoryRouter>
+    );
+    expect(await screen.findByText(/invite-only/)).toBeInTheDocument();
+    expect(screen.queryByText('Continue with GitHub')).not.toBeInTheDocument();
   });
 });
 
